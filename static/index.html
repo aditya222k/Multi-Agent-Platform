@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Agent Studio</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">✳</span><span>Local Agent Studio</span></div>
+      <nav class="main-nav" aria-label="Main navigation">
+        <button id="nav-bots" class="nav-button" type="button">Bot setup</button>
+        <button id="nav-chats" class="nav-button" type="button">Group chats</button>
+      </nav>
+      <span class="local-pill"><span class="live-dot"></span> Local</span>
+    </header>
+
+    <div id="notice" class="notice" role="status" hidden></div>
+
+    <main id="bots-page" class="page">
+      <div class="page-heading">
+        <div><p class="eyebrow">YOUR AGENTS</p><h1>Build your bots.</h1><p class="subtitle">Give each bot a role, an assignment, and its own model connection. Add it to any group chat.</p></div>
+        <button id="new-bot" class="button primary" type="button">+ New bot</button>
+      </div>
+      <div class="workspace-grid">
+        <aside class="rail-panel" aria-label="Bots">
+          <div class="rail-title"><strong>All bots</strong><span id="bot-count" class="count">0</span></div>
+          <div id="bot-list" class="rail-list"></div>
+        </aside>
+        <section class="editor-panel" aria-label="Bot settings">
+          <div id="bot-empty" class="empty-state"><span class="empty-icon">✳</span><h2>Create your first bot</h2><p>Set its role and connect it to a model endpoint. Then add it to a group chat.</p></div>
+          <div id="bot-editor" hidden>
+            <div class="editor-heading"><div><p class="eyebrow">BOT SETTINGS</p><h2 id="editor-title">Bot settings</h2></div><span id="bot-key-status" class="pill">No key</span></div>
+            <div class="form-section"><h3>Identity & work</h3><div class="field-grid">
+              <label class="field">Bot name<input id="bot-name" maxlength="80" placeholder="Researcher"></label>
+              <label class="field wide">Role<textarea id="bot-role" rows="3" maxlength="5000" placeholder="Who is this bot? What perspective does it bring?"></textarea></label>
+              <label class="field wide">Assignment<textarea id="bot-assignment" rows="3" maxlength="5000" placeholder="What should this bot do when it speaks in a group chat?"></textarea></label>
+            </div></div>
+            <div class="form-section"><div class="section-head"><h3>Model connection</h3><span class="section-note">One connection per bot</span></div><div class="field-grid">
+              <label class="field wide">API endpoint<input id="bot-endpoint" type="url" spellcheck="false" placeholder="https://your-provider.example/v1/chat/completions"></label>
+              <label class="field">Model ID<input id="bot-model" spellcheck="false" placeholder="Your model's ID"></label>
+              <label class="field">API format<select id="bot-format"><option value="chat_completions">Chat completions</option><option value="responses">Responses</option><option value="messages">Messages</option><option value="custom">Custom JSON</option></select></label>
+              <label class="field">API key header<input id="bot-auth-header" spellcheck="false" placeholder="Authorization"></label>
+              <label class="field">Prefix before key<input id="bot-auth-prefix" spellcheck="false" placeholder="Bearer "></label>
+              <label class="field wide">Extra headers <span class="field-help">JSON object, if your API requires them</span><textarea id="bot-headers" rows="2" spellcheck="false" placeholder="{}"></textarea></label>
+            </div>
+            <div id="custom-fields" class="field-grid custom-fields" hidden>
+              <label class="field wide">Request JSON template <span class="field-help">Use {{model}}, {{system}}, {{prompt}}, {{role}}, {{assignment}}, or {{api_key}}</span><textarea id="bot-template" rows="5" spellcheck="false" placeholder='{"model":"{{model}}","prompt":"{{prompt}}"}'></textarea></label>
+              <label class="field wide">Response text path <span class="field-help">Dot path such as choices.0.message.content</span><input id="bot-response-path" spellcheck="false" placeholder="output.text"></label>
+            </div>
+            <div class="key-box"><div><strong>API key for this bot</strong><p>Held in memory until the local server stops. Leave the key header empty for an API that needs no key.</p></div><div class="key-row"><input id="bot-key" type="password" autocomplete="off" placeholder="Paste a key for this bot"><button id="save-key" class="button secondary" type="button">Set key</button></div></div>
+            </div>
+            <div class="form-section"><div class="section-head"><h3>Group chats</h3><span class="section-note">Choose where this bot joins</span></div><div id="bot-groups" class="toggle-list"></div></div>
+            <div class="editor-actions"><button id="save-bot" class="button primary" type="button">Save bot</button><button id="delete-bot" class="button danger-text" type="button">Remove bot</button></div>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <main id="chats-page" class="page" hidden>
+      <div class="page-heading"><div><p class="eyebrow">SHARED WORKSPACES</p><h1>Group chats.</h1><p class="subtitle">Name each room, choose its bots, and let them take turns on your message.</p></div><button id="new-group" class="button primary" type="button">+ New group</button></div>
+      <div class="chat-grid">
+        <aside class="rail-panel groups-rail" aria-label="Group chats"><div class="rail-title"><strong>Your groups</strong><span id="group-count" class="count">0</span></div><div id="group-list" class="rail-list"></div></aside>
+        <section class="chat-panel" aria-label="Conversation">
+          <div id="chat-empty" class="empty-state"><span class="empty-icon">◌</span><h2>Start a group chat</h2><p>Create a group, add bots, and send a message.</p></div>
+          <div id="chat-content" hidden>
+            <div class="chat-header"><div class="chat-title-block"><p class="eyebrow">CURRENT GROUP</p><div class="name-row"><input id="group-name" maxlength="100" aria-label="Group chat name"><button id="save-group-name" class="button secondary small" type="button">Rename</button></div><p id="group-summary" class="section-note"></p></div><span id="run-status" class="pill">Ready</span></div>
+            <div id="messages" class="messages" aria-live="polite"></div>
+            <div id="run-error" class="run-error" hidden></div>
+            <div class="composer">
+              <label for="chat-input">Message the group</label>
+              <textarea id="chat-input" rows="4" maxlength="10000" placeholder="Give your bots a task or ask a question..."></textarea>
+              <div class="composer-actions"><span id="attached-count">No Desktop files attached</span><button id="send-message" class="button primary" type="button">Send to group <span aria-hidden="true">↗</span></button></div>
+            </div>
+          </div>
+        </section>
+        <aside class="side-panel" aria-label="Group controls">
+          <section class="control-card"><div class="control-heading"><h2>Bots in this chat</h2><span id="member-count" class="count">0</span></div><p class="hint">Switch bots on or off for this group. They speak in the order shown.</p><div id="group-members" class="toggle-list"></div></section>
+          <section class="control-card"><div class="control-heading"><h2>Desktop files</h2></div><p class="hint">Allow individual Desktop files, then select what this message may read. The selected text is sent to the bots' API endpoints.</p><div class="file-add"><input id="file-path" spellcheck="false" placeholder="/Users/you/Desktop/notes.txt" aria-label="Desktop file path"><button id="allow-file" class="button secondary small" type="button">Allow</button></div><button id="pick-file" class="link-button" type="button">Choose with file dialog</button><div id="grants" class="grant-list"></div><p class="tiny">Text files only · read-only · 128 KB each</p></section>
+        </aside>
+      </div>
+    </main>
+
+    <footer>Local Agent Studio · Keys stay in memory. Group history and file permissions stay on this computer.</footer>
+  </div>
+</body>
+</html>
