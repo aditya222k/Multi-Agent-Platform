@@ -37,7 +37,7 @@
             <div class="form-section"><h3>Identity & work</h3><div class="field-grid">
               <label class="field">Bot name<input id="bot-name" maxlength="80" placeholder="Researcher"></label>
               <label class="field wide">Role<textarea id="bot-role" rows="3" maxlength="5000" placeholder="Who is this bot? What perspective does it bring?"></textarea></label>
-              <label class="field wide">Assignment<textarea id="bot-assignment" rows="3" maxlength="5000" placeholder="What should this bot do when it speaks in a group chat?"></textarea></label>
+              <label class="field wide">Assignment<span class="field-help">Leave empty for general help. Otherwise, replies focus on this assignment. Save bot to apply changes.</span><textarea id="bot-assignment" rows="3" maxlength="5000" placeholder="What should this bot do when it speaks in a group chat?"></textarea></label>
             </div></div>
             <div class="form-section"><div class="section-head"><h3>Model connection</h3><span class="section-note">One connection per bot</span></div><div class="field-grid">
               <label class="field wide">API endpoint<input id="bot-endpoint" type="url" spellcheck="false" placeholder="https://your-provider.example/v1/chat/completions"></label>
@@ -68,16 +68,19 @@
           <div id="chat-empty" class="empty-state"><span class="empty-icon">◌</span><h2>Start a group chat</h2><p>Create a group, add bots, and send a message.</p></div>
           <div id="chat-content" hidden>
             <div class="chat-header"><div class="chat-title-block"><p class="eyebrow">CURRENT GROUP</p><div class="name-row"><input id="group-name" maxlength="100" aria-label="Group chat name"><button id="save-group-name" class="button secondary small" type="button">Rename</button></div><p id="group-summary" class="section-note"></p></div><span id="run-status" class="pill">Ready</span></div>
+            <div id="workflow-progress" class="workflow-progress" aria-live="polite" hidden></div>
             <div id="messages" class="messages" aria-live="polite"></div>
             <div id="run-error" class="run-error" hidden></div>
             <div class="composer">
               <label for="chat-input">Message the group</label>
               <textarea id="chat-input" rows="4" maxlength="10000" placeholder="Give your bots a task or ask a question..."></textarea>
-              <div class="composer-actions"><span id="attached-count">No Desktop files attached</span><button id="send-message" class="button primary" type="button">Send to group <span aria-hidden="true">↗</span></button></div>
+              <p id="conversation-hint" class="tiny">Bots take turns until you stop. Each turn builds on the conversation so far.</p>
+              <div class="composer-actions"><span id="attached-count">No Desktop files attached</span><div class="conversation-actions"><button id="stop-conversation" class="button stop-button" type="button" hidden>Stop conversation</button><button id="send-message" class="button primary" type="button">Start conversation <span aria-hidden="true">↗</span></button></div></div>
             </div>
           </div>
         </section>
         <aside class="side-panel" aria-label="Group controls">
+          <section class="control-card"><div class="control-heading"><h2>Run settings</h2></div><label class="field">Mode<select id="group-mode"><option value="workflow">Task workflow</option><option value="conversation">Group conversation</option></select></label><div id="workflow-settings"><label class="field">Reviewing master<select id="group-master"></select></label><label class="field">Quality criteria <span class="field-help">What must a result satisfy before the next worker starts?</span><textarea id="group-quality" rows="3" maxlength="4000" placeholder="Complete, accurate, follows the assignment, and usable by the next worker."></textarea></label><p class="hint">The master reviews each worker. Handoff requires both bots to agree. Every worker receives all approved results.</p></div><button id="save-run-settings" class="button secondary small" type="button">Save run settings</button></section>
           <section class="control-card"><div class="control-heading"><h2>Bots in this chat</h2><span id="member-count" class="count">0</span></div><p class="hint">Switch bots on or off for this group. They speak in the order shown.</p><div id="group-members" class="toggle-list"></div></section>
           <section class="control-card"><div class="control-heading"><h2>Desktop files</h2></div><p class="hint">Allow individual Desktop files, then select what this message may read. The selected text is sent to the bots' API endpoints.</p><div class="file-add"><input id="file-path" spellcheck="false" placeholder="/Users/you/Desktop/notes.txt" aria-label="Desktop file path"><button id="allow-file" class="button secondary small" type="button">Allow</button></div><button id="pick-file" class="link-button" type="button">Choose with file dialog</button><div id="grants" class="grant-list"></div><p class="tiny">Text files only · read-only · 128 KB each</p></section>
         </aside>

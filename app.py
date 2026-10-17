@@ -8,6 +8,7 @@ import json
 import secrets
 import subprocess
 import threading
+import time
 import uuid
 import webbrowser
 from datetime import datetime, timezone
@@ -16,7 +17,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from core import UserError, blank_bot, read_allowed_files, run_group_round, validate_bot, validate_desktop_file, validate_runnable
+from core import UserError, blank_bot, read_allowed_files, run_group_conversation, validate_bot, validate_desktop_file, validate_runnable
+from workflow import WorkflowBlocked, run_task_workflow
 
 
 ROOT = Path(__file__).resolve().parent
@@ -43,6 +45,7 @@ class State:
         self.grants: list[str] = []
         self.keys: dict[str, str] = {}
         self.runs: dict[str, dict] = {}
+        self.stop_events: dict[str, threading.Event] = {}
         self.load()
 
     def load(self) -> None:
@@ -72,7 +75,14 @@ class State:
                     for message in item.get("messages", []) if isinstance(item.get("messages"), list) else []:
                         if isinstance(message, dict) and isinstance(message.get("text"), str) and isinstance(message.get("sender"), str):
                             messages.append({"id": str(message.get("id", uuid.uuid4().hex)), "sender": message["sender"][:80], "bot_id": str(message.get("bot_id", "")), "text": message["text"][:100000], "created_at": str(message.get("created_at", "")), "files": message.get("files", []) if isinstance(message.get("files"), list) else []})
-                    groups.append({"id": item["id"], "name": name, "bot_ids": list(dict.fromkeys(members)), "messages": messages})
+                    group = {"id": item["id"], "name": name, "bot_ids": list(dict.fromkeys(members)), "messages": messages}
+                    group["mode"] = item.get("mode") if isinstance(item.get("mode"), str) and item.get("mode") in {"workflow", "conversation"} else "conversation"
+                    group["master_id"] = item.get("master_id") if item.get("master_id") in members else next(iter(members), "")
+                    group["quality_criteria"] = item.get("quality_criteria", "")[:4000] if isinstance(item.get("quality_criteria", ""), str) else ""
+                    last = item.get("last_workflow")
+                    if isinstance(last, dict) and isinstance(last.get("approved_results"), list):
+                        group["last_workflow"] = last
+                    groups.append(group)
                 self.groups = groups
             grants = data.get("grants", [])
             if isinstance(grants, list):
@@ -238,7 +248,7 @@ class Handler(BaseHTTPRequestHandler):
             elif len(parts) >= 3 and parts[:2] == ["api", "bots"]:
                 self._bot_action(parts[2:], body)
             elif parts == ["api", "groups"]:
-                item = {"id": uuid.uuid4().hex, "name": group_name(body.get("name", "New group")), "bot_ids": [], "messages": []}
+                item = {"id": uuid.uuid4().hex, "name": group_name(body.get("name", "New group")), "bot_ids": [], "messages": [], "mode": "workflow", "master_id": "", "quality_criteria": ""}
                 with STATE.lock:
                     STATE.groups.append(item)
                     STATE.save()
@@ -298,6 +308,8 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.keys.pop(bot_id, None)
                 for group in STATE.groups:
                     group["bot_ids"] = [item for item in group["bot_ids"] if item != bot_id]
+                    if group.get("master_id") == bot_id:
+                        group["master_id"] = next(iter(group["bot_ids"]), "")
                 STATE.save()
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
@@ -309,10 +321,32 @@ class Handler(BaseHTTPRequestHandler):
         if parts == [group_id, "send"]:
             self._send_group_message(group_id, body)
             return
+        if parts == [group_id, "stop"]:
+            with STATE.lock:
+                STATE.group(group_id)
+                for run in STATE.runs.values():
+                    if run["group_id"] == group_id and run["status"] == "running":
+                        STATE.stop_events[run["id"]].set()
+                        run.update(status="stopped", completion_reason="stopped", current_bot="")
+                        if run.get("workflow"):
+                            run["workflow"]["phase"] = "stopped"
+                            STATE.group(group_id)["last_workflow"] = copy.deepcopy(run["workflow"])
+                STATE.save()
+            self._json(HTTPStatus.OK, STATE.public())
+            return
         with STATE.lock:
             group = STATE.group(group_id)
             if parts == [group_id, "rename"]:
                 group["name"] = group_name(body.get("name"))
+            elif parts == [group_id, "settings"]:
+                mode = body.get("mode", group.get("mode", "conversation"))
+                master_id = body.get("master_id", group.get("master_id", ""))
+                criteria = body.get("quality_criteria", group.get("quality_criteria", ""))
+                if not isinstance(mode, str) or mode not in {"workflow", "conversation"} or not isinstance(master_id, str) or (master_id and master_id not in group["bot_ids"]):
+                    raise UserError("Choose a valid mode and a master who belongs to this group.")
+                if not isinstance(criteria, str) or len(criteria) > 4000:
+                    raise UserError("Quality criteria must be 4,000 characters or fewer.")
+                group.update(mode=mode, master_id=master_id, quality_criteria=criteria.strip())
             elif parts == [group_id, "members"]:
                 bot_id = body.get("bot_id")
                 enabled = body.get("enabled")
@@ -323,6 +357,8 @@ class Handler(BaseHTTPRequestHandler):
                     group["bot_ids"].append(bot_id)
                 if not enabled and bot_id in group["bot_ids"]:
                     group["bot_ids"].remove(bot_id)
+                if group.get("master_id") not in group["bot_ids"]:
+                    group["master_id"] = next(iter(group["bot_ids"]), "")
             elif parts == [group_id, "order"]:
                 order = body.get("bot_ids")
                 if not isinstance(order, list) or not all(isinstance(item, str) for item in order) or len(order) != len(set(order)) or set(order) != set(group["bot_ids"]):
@@ -338,13 +374,31 @@ class Handler(BaseHTTPRequestHandler):
         message = body.get("text")
         if not isinstance(message, str) or not 1 <= len(message.strip()) <= 10000:
             raise UserError("Enter a message of 10,000 characters or fewer.")
+        duration = body.get("duration_seconds", 0)
+        if type(duration) is not int or not 0 <= duration <= 600:
+            raise UserError("Choose one round or a duration between 1 and 600 seconds.")
+        continuous = body.get("continuous", duration == 0)
+        if type(continuous) is not bool or (continuous and duration):
+            raise UserError("Choose an ongoing conversation or a timed run.")
         with STATE.lock:
             group = STATE.group(group_id)
+            mode = body.get("mode", group.get("mode", "conversation"))
+            if not isinstance(mode, str) or mode not in {"workflow", "conversation"}:
+                raise UserError("Choose task workflow or group conversation.")
+            if mode == "workflow":
+                if duration:
+                    raise UserError("Task workflows finish through approvals, not a duration.")
+                continuous = False
             if any(run["group_id"] == group_id and run["status"] == "running" for run in STATE.runs.values()):
                 raise UserError("This group is already responding. Wait for its current turn.")
             bots = [copy.deepcopy(STATE.bot(bot_id)) for bot_id in group["bot_ids"]]
             if not bots:
                 raise UserError("Add at least one bot to this group chat.")
+            master_id = group.get("master_id") or bots[0]["id"]
+            if mode == "workflow" and (len(bots) < 2 or master_id not in group["bot_ids"]):
+                raise UserError("Choose a master and add at least one different worker.")
+            if (continuous or duration) and len(bots) < 2:
+                raise UserError("Add at least two bots to start a conversation.")
             keys = {bot["id"]: STATE.keys.get(bot["id"], "") for bot in bots}
             for bot in bots:
                 validate_runnable(bot, keys[bot["id"]])
@@ -354,32 +408,92 @@ class Handler(BaseHTTPRequestHandler):
             history = copy.deepcopy(group["messages"])
             group_title = group["name"]
             run_id = uuid.uuid4().hex
-            STATE.runs[run_id] = {"id": run_id, "group_id": group_id, "status": "running", "completed": 0, "total": len(bots), "error": ""}
+            STATE.runs[run_id] = {"id": run_id, "group_id": group_id, "status": "running", "completed": 0, "total": len(bots), "error": "", "continuous": continuous, "duration_seconds": duration, "ends_at": time.time() + duration if duration else None, "current_bot": "", "completion_reason": ""}
+            STATE.runs[run_id].update(mode=mode, master_id=master_id, quality_criteria=group.get("quality_criteria", ""))
+            if mode == "workflow":
+                group.pop("last_workflow", None)
+            STATE.stop_events[run_id] = threading.Event()
             while len(STATE.runs) > 30:
-                STATE.runs.pop(next(iter(STATE.runs)))
+                finished = next((key for key, run in STATE.runs.items() if run["status"] != "running" and key not in STATE.stop_events), None)
+                if finished is None:
+                    break
+                STATE.runs.pop(finished)
             STATE.save()
         threading.Thread(target=execute_group_run, args=(run_id, group_id, group_title, bots, history, files, keys), daemon=True).start()
         self._json(HTTPStatus.ACCEPTED, {"run_id": run_id})
 
 
 def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[dict], history: list[dict], files: list[tuple[str, str]], keys: dict[str, str]) -> None:
+    with STATE.lock:
+        duration = STATE.runs[run_id]["duration_seconds"]
+        continuous = STATE.runs[run_id]["continuous"]
+        mode = STATE.runs[run_id].get("mode", "conversation")
+        master_id = STATE.runs[run_id].get("master_id")
+        quality_criteria = STATE.runs[run_id].get("quality_criteria", "")
+        stop_event = STATE.stop_events[run_id]
+
+    def on_turn(bot: dict) -> None:
+        with STATE.lock:
+            if run_id in STATE.runs and STATE.runs[run_id]["status"] == "running":
+                STATE.runs[run_id]["current_bot"] = bot["name"]
+                STATE.runs[run_id]["waiting_reason"] = ""
+
+    def on_wait(message: str) -> None:
+        with STATE.lock:
+            if run_id in STATE.runs and STATE.runs[run_id]["status"] == "running":
+                STATE.runs[run_id]["waiting_reason"] = message
+
+    def on_progress(progress: dict) -> None:
+        with STATE.lock:
+            if run_id in STATE.runs and STATE.runs[run_id]["status"] == "running" and not stop_event.is_set():
+                run = STATE.runs[run_id]
+                run["workflow"] = copy.deepcopy(progress)
+                run["current_bot"] = progress["master"] if progress["phase"] == "reviewing" else progress["current_worker"]
+                STATE.group(group_id)["last_workflow"] = copy.deepcopy(progress)
+                STATE.save()
+
     def on_message(message: dict) -> None:
         complete = {"id": uuid.uuid4().hex, "sender": message["sender"], "bot_id": message["bot_id"], "text": message["text"], "created_at": now(), "files": []}
         with STATE.lock:
+            run = STATE.runs.get(run_id)
+            if not run or run["status"] != "running" or stop_event.is_set() or (run["ends_at"] is not None and time.time() >= run["ends_at"]):
+                return
             STATE.group(group_id)["messages"].append(complete)
             STATE.runs[run_id]["completed"] += 1
             STATE.save()
 
     try:
-        run_group_round(group_title, bots, history, files, keys, on_message)
+        if mode == "workflow":
+            master = next(bot for bot in bots if bot["id"] == master_id)
+            workers = [bot for bot in bots if bot["id"] != master_id]
+            reason = run_task_workflow(group_title, master, workers, history, files, keys, on_message,
+                                       quality_criteria=quality_criteria, stop_event=stop_event,
+                                       on_progress=on_progress, on_wait=on_wait)
+        else:
+            reason = run_group_conversation(group_title, bots, history, files, keys, on_message, duration_seconds=duration, continuous=continuous, stop_event=stop_event, on_turn=on_turn, on_wait=on_wait)
         with STATE.lock:
-            STATE.runs[run_id]["status"] = "complete"
+            if run_id in STATE.runs and STATE.runs[run_id]["status"] == "running":
+                STATE.runs[run_id].update(status="stopped" if reason == "stopped" else "complete", completion_reason=reason, current_bot="")
+    except WorkflowBlocked as error:
+        with STATE.lock:
+            if run_id in STATE.runs and STATE.runs[run_id]["status"] == "running":
+                run = STATE.runs[run_id]
+                run.update(status="blocked", error=str(error), current_bot="")
+                if run.get("workflow"):
+                    run["workflow"]["phase"] = "blocked"
+                    STATE.group(group_id)["last_workflow"] = copy.deepcopy(run["workflow"])
+                STATE.save()
     except UserError as error:
         with STATE.lock:
-            STATE.runs[run_id].update(status="failed", error=str(error))
+            if run_id in STATE.runs and STATE.runs[run_id]["status"] == "running":
+                STATE.runs[run_id].update(status="failed", error=str(error), current_bot="")
     except Exception:
         with STATE.lock:
-            STATE.runs[run_id].update(status="failed", error="The group turn failed unexpectedly. Check the server terminal.")
+            if run_id in STATE.runs and STATE.runs[run_id]["status"] == "running":
+                STATE.runs[run_id].update(status="failed", error="The group turn failed unexpectedly. Check the server terminal.", current_bot="")
+    finally:
+        with STATE.lock:
+            STATE.stop_events.pop(run_id, None)
 
 
 def main() -> None:
