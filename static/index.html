@@ -10,20 +10,20 @@
 <body>
   <div class="app-shell">
     <header class="topbar">
-      <div class="brand"><span class="brand-mark">✳</span><span>Local Agent Studio</span></div>
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>Local Agent Studio</span></div>
       <nav class="main-nav" aria-label="Main navigation">
         <button id="nav-bots" class="nav-button" type="button">Bot setup</button>
         <button id="nav-chats" class="nav-button" type="button">Group chats</button>
       </nav>
-      <span class="local-pill"><span class="live-dot"></span> Local</span>
+      <span class="local-pill"><span class="live-dot"></span>Running on this computer</span>
     </header>
 
     <div id="notice" class="notice" role="status" hidden></div>
 
     <main id="bots-page" class="page">
       <div class="page-heading">
-        <div><p class="eyebrow">YOUR AGENTS</p><h1>Build your bots.</h1><p class="subtitle">Give each bot a role, an assignment, and its own model connection. Add it to any group chat.</p></div>
-        <button id="new-bot" class="button primary" type="button">+ New bot</button>
+        <div><h1>Bots</h1><p class="subtitle">Give each bot a role, an assignment, and its own model connection. Add it to any group chat.</p></div>
+        <button id="new-bot" class="button primary" type="button">New bot</button>
       </div>
       <div class="workspace-grid">
         <aside class="rail-panel" aria-label="Bots">
@@ -31,9 +31,9 @@
           <div id="bot-list" class="rail-list"></div>
         </aside>
         <section class="editor-panel" aria-label="Bot settings">
-          <div id="bot-empty" class="empty-state"><span class="empty-icon">✳</span><h2>Create your first bot</h2><p>Set its role and connect it to a model endpoint. Then add it to a group chat.</p></div>
+          <div id="bot-empty" class="empty-state"><span class="empty-icon" aria-hidden="true"></span><h2>Create your first bot</h2><p>Set its role and connect it to a model endpoint. Then add it to a group chat.</p></div>
           <div id="bot-editor" hidden>
-            <div class="editor-heading"><div><p class="eyebrow">BOT SETTINGS</p><h2 id="editor-title">Bot settings</h2></div><span id="bot-key-status" class="pill">No key</span></div>
+            <div class="editor-heading"><div><h2 id="editor-title">Bot settings</h2></div><span id="bot-key-status" class="pill">No key</span></div>
             <div class="form-section"><h3>Identity & work</h3><div class="field-grid">
               <label class="field">Bot name<input id="bot-name" maxlength="80" placeholder="Researcher"></label>
               <label class="field wide">Role<textarea id="bot-role" rows="3" maxlength="5000" placeholder="Who is this bot? What perspective does it bring?"></textarea></label>
@@ -61,13 +61,13 @@
     </main>
 
     <main id="chats-page" class="page" hidden>
-      <div class="page-heading"><div><p class="eyebrow">SHARED WORKSPACES</p><h1>Group chats.</h1><p class="subtitle">Name each room, choose its bots, and let them take turns on your message.</p></div><button id="new-group" class="button primary" type="button">+ New group</button></div>
+      <div class="page-heading"><div><h1>Group chats</h1><p class="subtitle">Name each room, choose its bots, and let them take turns on your message.</p></div><button id="new-group" class="button primary" type="button">New group</button></div>
       <div class="chat-grid">
         <aside class="rail-panel groups-rail" aria-label="Group chats"><div class="rail-title"><strong>Your groups</strong><span id="group-count" class="count">0</span></div><div id="group-list" class="rail-list"></div></aside>
         <section class="chat-panel" aria-label="Conversation">
-          <div id="chat-empty" class="empty-state"><span class="empty-icon">◌</span><h2>Start a group chat</h2><p>Create a group, add bots, and send a message.</p></div>
+          <div id="chat-empty" class="empty-state"><span class="empty-icon" aria-hidden="true"></span><h2>Start a group chat</h2><p>Create a group, add bots, and send a message.</p></div>
           <div id="chat-content" hidden>
-            <div class="chat-header"><div class="chat-title-block"><p class="eyebrow">CURRENT GROUP</p><div class="name-row"><input id="group-name" maxlength="100" aria-label="Group chat name"><button id="save-group-name" class="button secondary small" type="button">Rename</button></div><p id="group-summary" class="section-note"></p></div><span id="run-status" class="pill">Ready</span></div>
+            <div class="chat-header"><div class="chat-title-block"><div class="name-row"><input id="group-name" maxlength="100" aria-label="Group chat name"><button id="save-group-name" class="button secondary small" type="button">Rename</button></div><p id="group-summary" class="section-note"></p></div><span id="run-status" class="pill">Ready</span></div>
             <div id="workflow-progress" class="workflow-progress" aria-live="polite" hidden></div>
             <div id="messages" class="messages" aria-live="polite"></div>
             <div id="run-error" class="run-error" hidden></div>
@@ -75,19 +75,19 @@
               <label for="chat-input">Message the group</label>
               <textarea id="chat-input" rows="4" maxlength="10000" placeholder="Give your bots a task or ask a question..."></textarea>
               <p id="conversation-hint" class="tiny">Bots take turns until you stop. Each turn builds on the conversation so far.</p>
-              <div class="composer-actions"><span id="attached-count">No Desktop files attached</span><div class="conversation-actions"><button id="stop-conversation" class="button stop-button" type="button" hidden>Stop conversation</button><button id="send-message" class="button primary" type="button">Start conversation <span aria-hidden="true">↗</span></button></div></div>
+              <div class="composer-actions"><span id="attached-count">No Desktop files attached</span><div class="conversation-actions"><button id="stop-conversation" class="button stop-button" type="button" hidden>Stop conversation</button><button id="send-message" class="button primary" type="button">Start conversation</button></div></div>
             </div>
           </div>
         </section>
         <aside class="side-panel" aria-label="Group controls">
           <section class="control-card"><div class="control-heading"><h2>Run settings</h2></div><label class="field">Mode<select id="group-mode"><option value="workflow">Task workflow</option><option value="conversation">Group conversation</option></select></label><div id="workflow-settings"><label class="field">Reviewing master<select id="group-master"></select></label><label class="field">Quality criteria <span class="field-help">What must a result satisfy before the next worker starts?</span><textarea id="group-quality" rows="3" maxlength="4000" placeholder="Complete, accurate, follows the assignment, and usable by the next worker."></textarea></label><p class="hint">The master reviews each worker. Handoff requires both bots to agree. Every worker receives all approved results.</p></div><button id="save-run-settings" class="button secondary small" type="button">Save run settings</button></section>
           <section class="control-card"><div class="control-heading"><h2>Bots in this chat</h2><span id="member-count" class="count">0</span></div><p class="hint">Switch bots on or off for this group. They speak in the order shown.</p><div id="group-members" class="toggle-list"></div></section>
-          <section class="control-card"><div class="control-heading"><h2>Desktop files</h2></div><p class="hint">Allow individual Desktop files, then select what this message may read. The selected text is sent to the bots' API endpoints.</p><div class="file-add"><input id="file-path" spellcheck="false" placeholder="/Users/you/Desktop/notes.txt" aria-label="Desktop file path"><button id="allow-file" class="button secondary small" type="button">Allow</button></div><button id="pick-file" class="link-button" type="button">Choose with file dialog</button><div id="grants" class="grant-list"></div><p class="tiny">Text files only · read-only · 128 KB each</p></section>
+          <section class="control-card"><div class="control-heading"><h2>Desktop files</h2></div><p class="hint">Allow individual Desktop files, then select what this message may read. The selected text is sent to the bots' API endpoints.</p><div class="file-add"><input id="file-path" spellcheck="false" placeholder="/Users/you/Desktop/notes.txt" aria-label="Desktop file path"><button id="allow-file" class="button secondary small" type="button">Allow</button></div><button id="pick-file" class="link-button" type="button">Choose with file dialog</button><div id="grants" class="grant-list"></div><p class="tiny">Text files only, read-only, up to 128 KB each.</p></section>
         </aside>
       </div>
     </main>
 
-    <footer>Local Agent Studio · Keys stay in memory. Group history and file permissions stay on this computer.</footer>
+    <footer>API keys stay in memory. Group history and file permissions stay on this computer.</footer>
   </div>
 </body>
 </html>

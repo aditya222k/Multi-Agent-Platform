@@ -52,6 +52,16 @@ function navigate(destination, groupId = selectedGroupId, push = true) {
 }
 
 function findBot(id) { return state.bots.find((bot) => bot.id === id); }
+// Each bot keeps one colour everywhere. Roster order keeps colours distinct; removed bots fall back to a hash.
+function voice(id) {
+  let index = state.bots.findIndex((bot) => bot.id === id);
+  if (index < 0) {
+    index = 2166136261;
+    for (const char of String(id)) index = Math.imul(index ^ char.charCodeAt(0), 16777619);
+    index = (index ^ (index >>> 15)) >>> 0;
+  }
+  return `voice-${index % 8}`;
+}
 function findGroup(id) { return state.groups.find((group) => group.id === id); }
 
 function renderBotList() {
@@ -61,7 +71,7 @@ function renderBotList() {
   for (const bot of state.bots) {
     const button = node('button', `rail-item${bot.id === selectedBotId ? ' active' : ''}`);
     button.type = 'button';
-    const avatar = node('span', 'rail-avatar', bot.name.slice(0, 1).toUpperCase());
+    const avatar = node('span', `rail-avatar ${voice(bot.id)}`, bot.name.slice(0, 1).toUpperCase());
     const copy = node('span', 'rail-copy');
     copy.append(node('strong', null, bot.name), node('small', null, bot.role || 'Role not set'));
     button.append(avatar, copy);
@@ -225,6 +235,9 @@ function renderWorkflowProgress(group, run) {
   const phases = { starting: 'Starting workflow', working: 'Worker preparing result', revising: 'Worker revising result', reviewing: 'Master reviewing quality', confirming: 'Worker confirming completion', handoff: 'Both approved · handing off', complete: 'All tasks approved', blocked: 'Waiting for your input', stopped: 'Workflow stopped' };
   host.append(node('strong', null, phases[flow.phase] || 'Task workflow'));
   const results = Array.isArray(flow.approved_results) ? flow.approved_results : [];
+  const meter = node('div', 'step-meter');
+  for (let index = 0; index < flow.task_total; index++) meter.append(node('span', index < results.length ? 'done' : index === results.length && flow.phase !== 'complete' ? 'current' : null));
+  host.append(meter);
   host.append(node('p', 'section-note', `${results.length}/${flow.task_total} tasks approved by both bots${flow.phase !== 'complete' && flow.current_worker ? ` · Current worker: ${flow.current_worker}` : ''}${flow.revision ? ` · Revision ${flow.revision}` : ''}`));
   for (const result of results) {
     const details = document.createElement('details');
@@ -261,7 +274,7 @@ function updateGroupSummary() {
   $('send-message').disabled = !!(run && run.status === 'running') || group.bot_ids.length < 2 || missingKeys.length > 0;
   const workflow = group.mode === 'workflow';
   $('conversation-hint').textContent = group.bot_ids.length < 2 ? 'Add at least two bots to start.' : missingKeys.length ? `Set API keys in Bot setup for: ${missingKeys.map((bot) => bot.name).join(', ')}.` : workflow ? 'Workers follow their assignments in order. The master and current worker must both approve before handoff.' : 'Bots take turns until you stop. Each turn builds on the conversation so far.';
-  $('send-message').textContent = workflow ? 'Start workflow' : 'Start conversation ↗';
+  $('send-message').textContent = workflow ? 'Start workflow' : 'Start conversation';
   $('stop-conversation').textContent = workflow ? 'Stop workflow' : 'Stop conversation';
   $('stop-conversation').hidden = !(run && run.status === 'running');
   $('stop-conversation').disabled = false;
@@ -315,7 +328,7 @@ function renderMessages() {
   if (!group.messages.length) host.append(node('div', 'conversation-empty', 'This group is ready. Send a message to begin.'));
   for (const message of group.messages) {
     const isUser = !message.bot_id;
-    const item = node('article', `message${isUser ? ' user' : ''}`);
+    const item = node('article', `message${isUser ? ' user' : ` ${voice(message.bot_id)}`}`);
     item.append(node('div', 'message-avatar', isUser ? 'Y' : message.sender.slice(0, 1).toUpperCase()));
     const content = node('div', 'message-content');
     const head = node('div', 'message-head');
@@ -329,7 +342,10 @@ function renderMessages() {
     item.append(content); host.append(item);
   }
   const run = latestRun(group.id);
-  if (run && run.status === 'running') host.append(node('div', 'waiting', run.waiting_reason || (run.current_bot ? `${run.current_bot} is replying…` : 'Starting the conversation…')));
+  if (run && run.status === 'running') {
+    const speaker = state.bots.find((bot) => bot.name === run.current_bot);
+    host.append(node('div', `waiting${speaker ? ` ${voice(speaker.id)}` : ''}`, run.waiting_reason || (run.current_bot ? `${run.current_bot} is replying…` : 'Starting the conversation…')));
+  }
   if (nearBottom || group.messages.length < 3) host.scrollTop = host.scrollHeight;
 }
 
