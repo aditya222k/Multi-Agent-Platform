@@ -84,7 +84,7 @@ Worker 1 submits ──► Master reviews ──► Worker confirms ──► bo
 2. Give each worker its task in Bot setup. You can also add group-wide **quality criteria**.
 3. Press **Start workflow** with your overall goal.
 
-Both approvals must point to the **same submitted result** before the next worker starts. A reply with an invalid decision is retried up to three times, and then the workflow stops. Progress and approved outputs are saved. Starting a new workflow begins a fresh task sequence.
+Both approvals must point to the **same submitted result** before the next worker starts. Each decision gets three attempts in total. If none returns a valid decision, the workflow stops without a handoff. Progress and approved outputs are saved. Starting a new workflow begins a fresh task sequence.
 
 ## Desktop files
 
