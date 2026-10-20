@@ -1,6 +1,9 @@
 import base64
+import io
+import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -60,6 +63,13 @@ class ImageGenerationTests(unittest.TestCase):
         self.assertEqual(core._error_message(b'{"detail":"Not allowed"}'), "Not allowed")
         self.assertEqual(core._error_message(b'{"error":{"message":"Bad key"}}'), "Bad key")
         self.assertEqual(core._error_message(b"oops"), "Request failed")
+
+    def test_large_echoed_error_bodies_are_read_in_full(self):
+        body = json.dumps({"detail": [{"loc": ["body", "prompt"], "msg": "Field required", "input": {"messages": "x" * 30000}}]}).encode()
+        error = urllib.error.HTTPError("https://chat.example.edu", 422, "Unprocessable", {}, io.BytesIO(body))
+        with patch.object(core.urllib.request.OpenerDirector, "open", side_effect=error):
+            with self.assertRaisesRegex(core.UserError, "HTTP 422: prompt: Field required"):
+                core._post_json("https://chat.example.edu/api", {}, {}, "test-key")
 
     def test_conversation_sends_only_the_latest_other_message_and_keeps_the_image(self):
         writer = dict(core.blank_bot("writer"), name="Writer")

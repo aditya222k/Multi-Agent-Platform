@@ -24,6 +24,8 @@ DESKTOP = Path.home() / "Desktop"
 MAX_FILE_BYTES = 128 * 1024
 MAX_TOTAL_BYTES = 512 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
+# FastAPI validation errors echo the request body, which can hold a long prompt.
+MAX_ERROR_BYTES = 64 * 1024
 FORMATS = {"chat_completions", "responses", "messages", "custom", "image_generation"}
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]{1,60}$")
 
@@ -273,7 +275,7 @@ def _post_json(url: str, headers: dict[str, str], body: dict, key: str, *, allow
         with opener.open(request, timeout=180) as response:
             raw = response.read(4 * 1024 * 1024 + 1)
     except urllib.error.HTTPError as error:
-        message = _error_message(error.read(4096))
+        message = _error_message(error.read(MAX_ERROR_BYTES))
         safe = str(message).replace(key, "[redacted]") if key else str(message)
         if error.code == 429:
             try:
@@ -302,7 +304,7 @@ def _get_bytes(url: str, headers: dict[str, str], key: str) -> bytes:
         with opener.open(request, timeout=120) as response:
             data = response.read(MAX_IMAGE_BYTES + 1)
     except urllib.error.HTTPError as error:
-        message = _error_message(error.read(4096))
+        message = _error_message(error.read(MAX_ERROR_BYTES))
         safe = message.replace(key, "[redacted]") if key else message
         raise UserError(f"Image download returned HTTP {error.code}: {safe[:300]}") from None
     except (urllib.error.URLError, TimeoutError):
