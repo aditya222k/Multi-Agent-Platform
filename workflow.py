@@ -88,6 +88,8 @@ def run_task_workflow(
         raise UserError("Choose a master and at least one different worker.")
     if len({bot["id"] for bot in workers}) != len(workers):
         raise UserError("Each worker must appear only once in the task sequence.")
+    if any(bot["api_format"] == "image_generation" for bot in [master, *workers]):
+        raise UserError("Image generation bots cannot approve or submit workflow results. Use a group conversation for them.")
     stop = stop_event if stop_event is not None else threading.Event()
     conversation = copy.deepcopy(messages)
     goal = next((m["text"] for m in reversed(messages) if not m.get("bot_id") and m["sender"] == "You"), "")

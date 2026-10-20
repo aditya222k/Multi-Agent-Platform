@@ -163,6 +163,7 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 .message-head strong{font-size:13px;font-weight:600;color:var(--v,var(--ink))}
 .message-head span{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
 .message-bubble{white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:1.6;padding:1px 0 1px 14px;border-left:2px solid var(--v,var(--line-strong))}
+.message-image{display:block;width:min(100%,420px);height:auto;border-radius:10px;margin:2px 0 10px;background:var(--line)}
 .message.user{align-self:flex-end;flex-direction:row-reverse}
 .message.user .message-avatar{background:var(--ink);color:var(--fog)}
 .message.user .message-head{justify-content:flex-end}

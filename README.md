@@ -46,6 +46,11 @@ If port 8765 is busy, run `python3 app.py --port 8766`.
 | Anthropic | `https://api.anthropic.com/v1/messages` | Messages | `x-api-key` | *(none)*, plus extra header `{"anthropic-version": "2023-06-01"}` |
 | OpenAI | `https://api.openai.com/v1/chat/completions` | Chat completions | `Authorization` | `Bearer ` |
 | Local (e.g. Ollama) | `http://localhost:11434/v1/chat/completions` | Chat completions | `Authorization` | `Bearer ` |
+| Images (OpenAI or Open WebUI) | `https://api.openai.com/v1/images/generations` | Image generation | `Authorization` | `Bearer ` |
+
+### Image bots
+
+Bots using the **Image generation** format turn the latest message from another participant into a picture. The image is saved under `.local/images/` and shown in the chat. Image bots join group conversations but not task workflows.
 
 ### Role vs. assignment
 
@@ -116,7 +121,7 @@ tests/         Unit tests using local fakes
 - Bot instructions guide the model but don't guarantee that every model follows them.
 - Model-based review is a judgment call, not a guarantee of factual accuracy.
 - Streaming, OAuth flows, and provider tool calls are not yet supported.
-- This is a text-only platform. Bots can't run tools or change files.
+- Bots can't run tools or change files. Image bots can generate pictures, but no bot can read images.
 - Requests already sent when you press Stop may still finish, and the provider may still bill you for them. Their replies are discarded.
 - Bot or membership changes made during a run take effect on the next run.
 

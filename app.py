@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import secrets
 import subprocess
 import threading
@@ -23,6 +24,9 @@ from workflow import WorkflowBlocked, run_task_workflow
 
 ROOT = Path(__file__).resolve().parent
 SETTINGS_FILE = ROOT / ".local" / "settings.json"
+IMAGES_DIR = ROOT / ".local" / "images"
+IMAGE_NAME = re.compile(r"^[0-9a-f]{32}\.(png|jpg|gif|webp)$")
+IMAGE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
 MAX_REQUEST_BYTES = 100 * 1024
 
 
@@ -75,6 +79,8 @@ class State:
                     for message in item.get("messages", []) if isinstance(item.get("messages"), list) else []:
                         if isinstance(message, dict) and isinstance(message.get("text"), str) and isinstance(message.get("sender"), str):
                             messages.append({"id": str(message.get("id", uuid.uuid4().hex)), "sender": message["sender"][:80], "bot_id": str(message.get("bot_id", "")), "text": message["text"][:100000], "created_at": str(message.get("created_at", "")), "files": message.get("files", []) if isinstance(message.get("files"), list) else []})
+                            if isinstance(message.get("image"), str) and IMAGE_NAME.fullmatch(message["image"]):
+                                messages[-1]["image"] = message["image"]
                     group = {"id": item["id"], "name": name, "bot_ids": list(dict.fromkeys(members)), "messages": messages}
                     group["mode"] = item.get("mode") if isinstance(item.get("mode"), str) and item.get("mode") in {"workflow", "conversation"} else "conversation"
                     group["master_id"] = item.get("master_id") if item.get("master_id") in members else next(iter(members), "")
@@ -161,11 +167,11 @@ class Handler(BaseHTTPRequestHandler):
     def _authorized(self) -> bool:
         return secrets.compare_digest(self.headers.get("X-Local-Token", ""), STATE.token)
 
-    def _send(self, status: int, data: bytes, content_type: str) -> None:
+    def _send(self, status: int, data: bytes, content_type: str, cache: str = "no-store") -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
@@ -214,6 +220,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.FORBIDDEN, {"error": "Use the URL printed by the server."})
                 return
             self._send(HTTPStatus.OK, (ROOT / "static" / "index.html").read_bytes(), "text/html; charset=utf-8")
+            return
+        if path.path.startswith("/media/"):
+            # <img> requests cannot send the token header, so images take it as a query.
+            name = path.path.removeprefix("/media/")
+            token = parse_qs(path.query).get("token", [""])[0]
+            if not secrets.compare_digest(token, STATE.token):
+                self._json(HTTPStatus.FORBIDDEN, {"error": "Use the URL printed by the server."})
+                return
+            try:
+                if not IMAGE_NAME.fullmatch(name):
+                    raise OSError
+                data = (IMAGES_DIR / name).read_bytes()
+            except OSError:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "Image not found."})
+                return
+            # Image files never change, so the browser can keep them between polls.
+            self._send(HTTPStatus.OK, data, IMAGE_TYPES[name.rsplit(".", 1)[1]], "private, max-age=31536000, immutable")
             return
         if path.path in {"/static/app.js", "/static/style.css"}:
             file = ROOT / path.path.lstrip("/")
@@ -423,6 +446,15 @@ class Handler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.ACCEPTED, {"run_id": run_id})
 
 
+def save_image(data: bytes, kind: str) -> str:
+    IMAGES_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    name = f"{uuid.uuid4().hex}.{kind}"
+    path = IMAGES_DIR / name
+    path.write_bytes(data)
+    path.chmod(0o600)
+    return name
+
+
 def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[dict], history: list[dict], files: list[tuple[str, str]], keys: dict[str, str]) -> None:
     with STATE.lock:
         duration = STATE.runs[run_id]["duration_seconds"]
@@ -458,6 +490,8 @@ def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[d
             run = STATE.runs.get(run_id)
             if not run or run["status"] != "running" or stop_event.is_set() or (run["ends_at"] is not None and time.time() >= run["ends_at"]):
                 return
+            if message.get("image"):
+                complete["image"] = save_image(message["image"], message["image_type"])
             STATE.group(group_id)["messages"].append(complete)
             STATE.runs[run_id]["completed"] += 1
             STATE.save()

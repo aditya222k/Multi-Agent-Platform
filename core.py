@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import queue
@@ -15,13 +17,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 
 DESKTOP = Path.home() / "Desktop"
 MAX_FILE_BYTES = 128 * 1024
 MAX_TOTAL_BYTES = 512 * 1024
-FORMATS = {"chat_completions", "responses", "messages", "custom"}
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+FORMATS = {"chat_completions", "responses", "messages", "custom", "image_generation"}
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]{1,60}$")
 
 
@@ -241,18 +244,36 @@ def _tls_context() -> ssl.SSLContext:
     return context
 
 
-def _post_json(url: str, headers: dict[str, str], body: dict, key: str) -> dict:
+def _error_message(raw: bytes) -> str:
+    try:
+        detail = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return "Request failed"
+    if not isinstance(detail, dict):
+        return "Request failed"
+    if isinstance(detail.get("error"), dict) and detail["error"].get("message"):
+        return str(detail["error"]["message"])
+    # FastAPI servers (such as Open WebUI) report errors under "detail".
+    if isinstance(detail.get("detail"), str):
+        return detail["detail"]
+    if isinstance(detail.get("detail"), list):
+        problems = [
+            f"{'.'.join(map(str, item.get('loc', [])[1:])) or 'request'}: {item.get('msg', 'invalid')}"
+            for item in detail["detail"] if isinstance(item, dict)
+        ]
+        if problems:
+            return "; ".join(problems)
+    return "Request failed"
+
+
+def _post_json(url: str, headers: dict[str, str], body: dict, key: str, *, allow_list: bool = False) -> dict | list:
     request = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json", **headers}, method="POST")
     try:
         opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=_tls_context()))
-        with opener.open(request, timeout=120) as response:
+        with opener.open(request, timeout=180) as response:
             raw = response.read(4 * 1024 * 1024 + 1)
     except urllib.error.HTTPError as error:
-        try:
-            detail = json.loads(error.read(4096).decode("utf-8"))
-            message = detail.get("error", {}).get("message", "Request failed")
-        except (ValueError, AttributeError, UnicodeDecodeError):
-            message = "Request failed"
+        message = _error_message(error.read(4096))
         safe = str(message).replace(key, "[redacted]") if key else str(message)
         if error.code == 429:
             try:
@@ -269,9 +290,93 @@ def _post_json(url: str, headers: dict[str, str], body: dict, key: str) -> dict:
         result = json.loads(raw)
     except (ValueError, UnicodeDecodeError):
         raise UserError("The API did not return valid JSON.") from None
-    if not isinstance(result, dict):
+    if not isinstance(result, dict) and not (allow_list and isinstance(result, list)):
         raise UserError("The API returned an unexpected JSON response.")
     return result
+
+
+def _get_bytes(url: str, headers: dict[str, str], key: str) -> bytes:
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=_tls_context()))
+        with opener.open(request, timeout=120) as response:
+            data = response.read(MAX_IMAGE_BYTES + 1)
+    except urllib.error.HTTPError as error:
+        message = _error_message(error.read(4096))
+        safe = message.replace(key, "[redacted]") if key else message
+        raise UserError(f"Image download returned HTTP {error.code}: {safe[:300]}") from None
+    except (urllib.error.URLError, TimeoutError):
+        raise UserError("Could not download the generated image.") from None
+    if len(data) > MAX_IMAGE_BYTES:
+        raise UserError("The generated image is too large.")
+    return data
+
+
+def image_type(data: bytes) -> str:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return ""
+
+
+def image_prompt(messages: list[dict], bot: dict) -> str:
+    """Image models take one short description, not the whole chat transcript."""
+    for message in reversed(messages):
+        if message.get("bot_id") != bot["id"] and message["text"].strip():
+            return message["text"].strip()
+    raise UserError(f"{bot['name']} needs a message to turn into an image.")
+
+
+def generate_image(bot: dict, prompt: str, key: str) -> dict:
+    validate_runnable(bot, key)
+    # DALL-E 2 rejects prompts over 1,000 characters; newer models accept more.
+    prompt = prompt.strip()[:1000 if bot["model"] == "dall-e-2" else 4000]
+    headers = bot["extra_headers"].copy()
+    if bot["auth_header"]:
+        headers[bot["auth_header"]] = bot["auth_prefix"] + key
+    response = _post_json(bot["endpoint"], headers, {"model": bot["model"], "prompt": prompt, "n": 1}, key, allow_list=True)
+    # Open WebUI returns a list of file links; OpenAI returns {"data": [...]}.
+    items = response if isinstance(response, list) else response.get("data")
+    first = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else {}
+    if isinstance(first.get("b64_json"), str):
+        try:
+            data = base64.b64decode(first["b64_json"], validate=True)
+        except (binascii.Error, ValueError):
+            raise UserError(f"{bot['name']} received an unreadable image.") from None
+    elif isinstance(first.get("url"), str):
+        url = urljoin(bot["endpoint"], first["url"])
+        parsed, origin = urlsplit(url), urlsplit(bot["endpoint"])
+        same_origin = (parsed.scheme, parsed.netloc) == (origin.scheme, origin.netloc)
+        if not same_origin and parsed.scheme != "https":
+            raise UserError(f"{bot['name']} returned an image link that is not HTTPS.")
+        # Send the API key only back to the endpoint's own server.
+        data = _get_bytes(url, headers if same_origin else {}, key)
+    else:
+        raise UserError(f"{bot['name']} received no image from its API endpoint.")
+    kind = image_type(data)
+    if not kind:
+        raise UserError(f"{bot['name']} received a file that is not a supported image.")
+    return {"text": prompt, "image": data, "image_type": kind}
+
+
+def bot_message(bot: dict, output: str | dict) -> dict:
+    message = {"sender": bot["name"], "bot_id": bot["id"]}
+    if isinstance(output, dict):
+        message.update(text=output["text"], image=output["image"], image_type=output["image_type"])
+    else:
+        message["text"] = output
+    return message
+
+
+def turn_prompt(group_name: str, messages: list[dict], files: list[tuple[str, str]], bot: dict, next_bot: dict | None) -> str:
+    if bot["api_format"] == "image_generation":
+        return image_prompt(messages, bot)
+    return make_prompt(group_name, messages, files, bot=bot, next_bot=next_bot)
 
 
 def _replace_template(value: object, values: dict[str, str]) -> object:
@@ -338,7 +443,9 @@ def bot_instructions(bot: dict) -> str:
     )
 
 
-def call_bot(bot: dict, prompt: str, key: str, *, instruction_context: str = "") -> str:
+def call_bot(bot: dict, prompt: str, key: str, *, instruction_context: str = "") -> str | dict:
+    if bot["api_format"] == "image_generation":
+        return generate_image(bot, prompt, key)
     validate_runnable(bot, key)
     system = bot_instructions(bot)
     if instruction_context:
@@ -390,9 +497,9 @@ def run_group_round(
     added = []
     for index, bot in enumerate(bots):
         next_bot = bots[index + 1] if index + 1 < len(bots) else None
-        prompt = make_prompt(group_name, conversation, files, bot=bot, next_bot=next_bot)
+        prompt = turn_prompt(group_name, conversation, files, bot, next_bot)
         output = model_call(bot, prompt, keys.get(bot["id"], ""))
-        message = {"sender": bot["name"], "bot_id": bot["id"], "text": output}
+        message = bot_message(bot, output)
         conversation.append(message)
         added.append(message)
         on_message(message)
@@ -430,8 +537,8 @@ def run_group_conversation(
             return "time_limit"
         bot = bots[turn % len(bots)]
         next_bot = bots[(turn + 1) % len(bots)] if looping or turn + 1 < len(bots) else None
-        prompt = make_prompt(group_name, conversation, files, bot=bot, next_bot=next_bot)
-        if looping:
+        prompt = turn_prompt(group_name, conversation, files, bot, next_bot)
+        if looping and bot["api_format"] != "image_generation":
             prompt += "\nThis is an ongoing conversation between the bots. Respond to the latest participant's contribution and build on what they said within your assignment. Give one useful reply or relevant follow-up question, then let the next participant speak. Do not repeat earlier material or ask the human to send 'continue'."
         on_turn(bot)
         result: queue.Queue = queue.Queue(maxsize=1)
@@ -475,7 +582,7 @@ def run_group_conversation(
             break
         if retry:
             continue
-        message = {"sender": bot["name"], "bot_id": bot["id"], "text": output}
+        message = bot_message(bot, output)
         on_message(message)
         conversation.append(message)
         turn += 1

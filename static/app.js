@@ -337,7 +337,15 @@ function renderMessages() {
       const time = new Date(message.created_at);
       if (!Number.isNaN(time.getTime())) head.append(node('span', null, time.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })));
     }
-    content.append(head, node('div', 'message-bubble', message.text));
+    const bubble = node('div', 'message-bubble', message.text);
+    if (message.image) {
+      const image = node('img', 'message-image');
+      image.src = `/media/${encodeURIComponent(message.image)}?${new URLSearchParams({ token })}`;
+      image.alt = message.text.slice(0, 300);
+      image.loading = 'lazy';
+      bubble.prepend(image);
+    }
+    content.append(head, bubble);
     if (message.files && message.files.length) content.append(node('div', 'attached-files', `Attached: ${message.files.map((path) => path.split('/').pop()).join(', ')}`));
     item.append(content); host.append(item);
   }
