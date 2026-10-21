@@ -16,9 +16,26 @@
         <button id="nav-chats" class="nav-button" type="button">Group chats</button>
       </nav>
       <span class="local-pill"><span class="live-dot"></span>Running on this computer</span>
+      <span id="account" class="account" hidden><span id="account-email"></span><button id="sign-out" class="link-button" type="button">Sign out</button></span>
     </header>
 
     <div id="notice" class="notice" role="status" hidden></div>
+
+    <main id="login-page" class="page login-page" hidden>
+      <form id="login-form" class="login-card">
+        <h1>Sign in</h1>
+        <p class="subtitle">Your bots and chats are saved to your Supabase account. API keys still stay on this computer.</p>
+        <label class="field">Email<input id="login-email" type="email" autocomplete="username" maxlength="320" required></label>
+        <label class="field">Password<input id="login-password" type="password" autocomplete="current-password" maxlength="1000" required></label>
+        <button id="login-submit" class="button primary" type="submit">Sign in</button>
+        <p id="login-error" class="login-error" role="alert" hidden></p>
+      </form>
+      <section id="import-card" class="login-card" hidden>
+        <h1>Bring your local chats?</h1>
+        <p class="subtitle">This account is empty, and this computer has saved bots and chats. Copy them into your account? Your local copy stays as it is.</p>
+        <div class="login-actions"><button id="import-local" class="button primary" type="button">Import local data</button><button id="skip-import" class="button secondary" type="button">Start empty</button></div>
+      </section>
+    </main>
 
     <main id="bots-page" class="page">
       <div class="page-heading">
@@ -87,7 +104,7 @@
       </div>
     </main>
 
-    <footer>API keys stay in memory. Group history and file permissions stay on this computer.</footer>
+    <footer id="footer-note">API keys stay in memory. Group history and file permissions stay on this computer.</footer>
   </div>
 </body>
 </html>

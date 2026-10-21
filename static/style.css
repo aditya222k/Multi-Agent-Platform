@@ -163,6 +163,13 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 .message-head strong{font-size:13px;font-weight:600;color:var(--v,var(--ink))}
 .message-head span{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
 .message-bubble{white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:1.6;padding:1px 0 1px 14px;border-left:2px solid var(--v,var(--line-strong))}
+.account{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px;white-space:nowrap}
+.login-page{display:flex;justify-content:center}
+.login-card{width:min(100%,420px);display:grid;gap:16px;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:28px 32px;margin-top:24px}
+.login-card h1{margin:0;font-size:24px}.login-card .subtitle{margin:0}
+.login-card input{padding:9px 11px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface)}
+.login-actions{display:flex;gap:10px;flex-wrap:wrap}
+.login-error{margin:0;padding:10px 14px;background:var(--danger-soft);border-left:3px solid var(--danger);border-radius:4px;color:var(--danger);font-size:13px}
 .message-image{display:block;width:min(100%,420px);height:auto;border-radius:10px;margin:2px 0 10px;background:var(--line)}
 .message.user{align-self:flex-end;flex-direction:row-reverse}
 .message.user .message-avatar{background:var(--ink);color:var(--fog)}

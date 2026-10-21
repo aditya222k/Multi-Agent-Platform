@@ -98,7 +98,7 @@ class ImageStorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             settings = Path(temp) / "settings.json"
             with patch.object(app, "SETTINGS_FILE", settings), patch.object(app, "IMAGES_DIR", Path(temp) / "images"):
-                name = app.save_image(PNG, "png")
+                name = app.State().store.save_image(PNG, "png")
                 self.assertTrue(app.IMAGE_NAME.fullmatch(name))
                 self.assertEqual((Path(temp) / "images" / name).read_bytes(), PNG)
                 self.assertEqual((Path(temp) / "images" / name).stat().st_mode & 0o777, 0o600)

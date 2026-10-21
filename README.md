@@ -98,11 +98,24 @@ Both approvals must point to the **same submitted result** before the next worke
 - Each file is read once as a read-only UTF-8 snapshot and sent to the bots in that group. The app never edits files.
 - Limits: 128 KB per file, 512 KB total, 20 files per message.
 
+## Optional: Supabase accounts
+
+By default everything is saved on your computer and no setup is needed. To keep bots and chats in a Supabase account instead, so each person signs in and sees only their own data:
+
+1. Create a project at [supabase.com](https://supabase.com).
+2. Open **SQL Editor**, paste [`supabase/schema.sql`](supabase/schema.sql), and run it. It creates the tables, row-level security rules, and a private `images` bucket.
+3. Under **Authentication → Sign In / Providers**, turn off public sign-ups, then invite each person from **Authentication → Users**.
+4. Copy `.env.example` to `.env` and fill in the **Project URL** and **publishable (anon) key** from **Project Settings → API**. Never use the secret / `service_role` key.
+5. Run `python3 app.py` and sign in.
+
+If the account is empty and this computer has local data, the app offers to import it. API keys and Desktop file permissions stay on your computer either way. Delete `.env` to go back to local storage.
+
 ## Security and privacy
 
 - The server binds to `127.0.0.1` only and requires a random launch token.
 - **API keys live in server memory only.** Re-enter them after a restart.
-- Bot settings, chat history, and allowed file paths are stored in `.local/settings.json` with owner-only permissions. Git ignores this file.
+- Without Supabase, bot settings, chat history, and allowed file paths are stored in `.local/settings.json` with owner-only permissions. Git ignores this file and `.env`.
+- With Supabase, bots, chats, and generated images are sent to your Supabase project, protected by row-level security. Allowed file paths stay in `.local/grants.json`.
 - HTTPS certificates are verified. On macOS without default certificates, `/etc/ssl/cert.pem` is used. `SSL_CERT_FILE` and `SSL_CERT_DIR` take precedence.
 - File content you share is sent to the API endpoints of the bots in that group.
 
@@ -110,9 +123,11 @@ Both approvals must point to the **same submitted result** before the next worke
 
 ```
 static/        Frontend (index.html, app.js, style.css)
-app.py         HTTP server, saved state, and background conversation runs
+app.py         HTTP server, saved state, sign-in, and background conversation runs
 core.py        Bot validation, prompt building, model API calls, file access
+storage.py     Local JSON storage or a Supabase account (auth, tables, images)
 workflow.py    Approval-gated task workflow engine
+supabase/      Schema to run once in the Supabase SQL editor
 tests/         Unit tests using local fakes
 ```
 

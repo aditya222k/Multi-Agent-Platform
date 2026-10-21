@@ -17,8 +17,31 @@ async function api(path, body) {
   }
   const response = await fetch(path, options);
   const data = await response.json();
+  if (response.status === 401 && data.login_required) showLogin();
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
+}
+
+// With Supabase configured, the app waits behind this sign-in screen.
+function showLogin() {
+  clearTimeout(pollTimer);
+  for (const id of ['bots-page', 'chats-page', 'account', 'import-card']) $(id).hidden = true;
+  document.querySelector('.main-nav').hidden = true;
+  $('login-page').hidden = false;
+  $('login-form').hidden = false;
+  $('login-email').focus();
+}
+
+function showAccount(session) {
+  $('login-page').hidden = true;
+  document.querySelector('.main-nav').hidden = false;
+  $('account').hidden = session.mode !== 'supabase';
+  $('account-email').textContent = session.email;
+  if (session.mode === 'supabase') $('footer-note').textContent = 'Bots and chats are saved to your Supabase account. API keys and Desktop file permissions stay on this computer.';
+}
+
+function showSyncError() {
+  if (state.sync_error) notice(state.sync_error, true);
 }
 
 function notice(message, error = false) {
@@ -405,19 +428,68 @@ async function pollRuns() {
     renderGroupList(); renderBotGroups(); renderChat(false);
     const failed = state.runs.find((run) => previouslyRunning.has(run.id) && run.status === 'failed');
     if (failed) notice(failed.error, true);
+    else showSyncError();
     if (state.runs.some((run) => run.status === 'running')) pollTimer = setTimeout(pollRuns, 1200);
   } catch (error) { notice(error.message, true); }
 }
 
+async function startApp() {
+  state = await api('/api/state');
+  selectedBotId = state.bots[0]?.id || null;
+  if (!findGroup(selectedGroupId)) selectedGroupId = state.groups[0]?.id || null;
+  navigate(page(), selectedGroupId, false);
+  showSyncError();
+  if (state.runs.some((run) => run.status === 'running')) pollRuns();
+}
+
 async function initialize() {
   try {
-    state = await api('/api/state');
-    selectedBotId = state.bots[0]?.id || null;
-    if (!findGroup(selectedGroupId)) selectedGroupId = state.groups[0]?.id || null;
-    navigate(page(), selectedGroupId, false);
-    if (state.runs.some((run) => run.status === 'running')) pollRuns();
+    const session = await api('/api/session');
+    if (!session.signed_in) { showLogin(); return; }
+    showAccount(session);
+    await startApp();
   } catch (error) { notice(error.message, true); }
 }
+
+$('login-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = $('login-submit');
+  button.disabled = true;
+  $('login-error').hidden = true;
+  try {
+    const session = await api('/api/login', { email: $('login-email').value, password: $('login-password').value });
+    $('login-password').value = '';
+    if (session.can_import) {
+      $('login-form').hidden = true;
+      $('import-card').hidden = false;
+      $('account-email').textContent = session.email;
+      return;
+    }
+    showAccount(session);
+    await startApp();
+  } catch (error) {
+    $('login-error').textContent = error.message;
+    $('login-error').hidden = false;
+  } finally { button.disabled = false; }
+});
+$('import-local').addEventListener('click', async () => {
+  $('import-local').disabled = true;
+  try {
+    await api('/api/import-local', {});
+    showAccount(await api('/api/session'));
+    await startApp();
+    notice('Local bots and chats imported into your account.');
+  } catch (error) { notice(error.message, true); }
+  finally { $('import-local').disabled = false; }
+});
+$('skip-import').addEventListener('click', async () => {
+  try { showAccount(await api('/api/session')); await startApp(); }
+  catch (error) { notice(error.message, true); }
+});
+$('sign-out').addEventListener('click', async () => {
+  try { await api('/api/logout', {}); }
+  finally { state = { bots: [], groups: [], grants: [], key_status: {}, runs: [] }; showLogin(); }
+});
 
 $('nav-bots').addEventListener('click', () => { if (page() === 'chats') navigate('bots'); });
 $('nav-chats').addEventListener('click', () => { if (page() === 'bots') { stashDraft(); navigate('chats'); } });
