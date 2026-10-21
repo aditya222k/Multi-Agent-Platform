@@ -26,7 +26,6 @@ MAX_TOTAL_BYTES = 512 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 # FastAPI validation errors echo the request body, which can hold a long prompt.
 MAX_ERROR_BYTES = 64 * 1024
-FORMATS = {"chat_completions", "responses", "messages", "custom", "image_generation"}
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]{1,60}$")
 
 
@@ -81,7 +80,7 @@ def validate_bot(raw: object, bot_id: str) -> dict:
     limits = {"name": 80, "role": 5000, "assignment": 5000, "endpoint": 1000, "model": 120, "auth_header": 60, "auth_prefix": 80, "request_template": 16000, "response_path": 300}
     if not bot["name"] or any(len(bot[key]) > limit for key, limit in limits.items()):
         raise UserError("A bot name is required and one of the fields is too long.")
-    if bot["api_format"] not in FORMATS:
+    if bot["api_format"] not in ADAPTERS:
         raise UserError("Choose a supported API format.")
     if bot["endpoint"]:
         validate_endpoint(bot["endpoint"])
@@ -116,10 +115,7 @@ def validate_runnable(bot: dict, key: str) -> None:
     validate_endpoint(bot["endpoint"])
     if bot["auth_header"] and not key:
         raise UserError(f"Add an API key for {bot['name']}.")
-    if bot["api_format"] == "custom" and (not bot["request_template"] or not bot["response_path"]):
-        raise UserError(f"Add a request template and response path for {bot['name']}.")
-    if bot["api_format"] == "custom" and not any(token in bot["request_template"] for token in ("{{system}}", "{{prompt}}")):
-        raise UserError("The custom request template must include {{system}} or {{prompt}} so the bot receives its instructions.")
+    adapter_for(bot).check(bot)
 
 
 def validate_desktop_file(path: object, desktop: Path = DESKTOP) -> str:
@@ -334,38 +330,6 @@ def image_prompt(messages: list[dict], bot: dict) -> str:
     raise UserError(f"{bot['name']} needs a message to turn into an image.")
 
 
-def generate_image(bot: dict, prompt: str, key: str) -> dict:
-    validate_runnable(bot, key)
-    # DALL-E 2 rejects prompts over 1,000 characters; newer models accept more.
-    prompt = prompt.strip()[:1000 if bot["model"] == "dall-e-2" else 4000]
-    headers = bot["extra_headers"].copy()
-    if bot["auth_header"]:
-        headers[bot["auth_header"]] = bot["auth_prefix"] + key
-    response = _post_json(bot["endpoint"], headers, {"model": bot["model"], "prompt": prompt, "n": 1}, key, allow_list=True)
-    # Open WebUI returns a list of file links; OpenAI returns {"data": [...]}.
-    items = response if isinstance(response, list) else response.get("data")
-    first = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else {}
-    if isinstance(first.get("b64_json"), str):
-        try:
-            data = base64.b64decode(first["b64_json"], validate=True)
-        except (binascii.Error, ValueError):
-            raise UserError(f"{bot['name']} received an unreadable image.") from None
-    elif isinstance(first.get("url"), str):
-        url = urljoin(bot["endpoint"], first["url"])
-        parsed, origin = urlsplit(url), urlsplit(bot["endpoint"])
-        same_origin = (parsed.scheme, parsed.netloc) == (origin.scheme, origin.netloc)
-        if not same_origin and parsed.scheme != "https":
-            raise UserError(f"{bot['name']} returned an image link that is not HTTPS.")
-        # Send the API key only back to the endpoint's own server.
-        data = _get_bytes(url, headers if same_origin else {}, key)
-    else:
-        raise UserError(f"{bot['name']} received no image from its API endpoint.")
-    kind = image_type(data)
-    if not kind:
-        raise UserError(f"{bot['name']} received a file that is not a supported image.")
-    return {"text": prompt, "image": data, "image_type": kind}
-
-
 def bot_message(bot: dict, output: str | dict) -> dict:
     message = {"sender": bot["name"], "bot_id": bot["id"]}
     if isinstance(output, dict):
@@ -376,7 +340,7 @@ def bot_message(bot: dict, output: str | dict) -> dict:
 
 
 def turn_prompt(group_name: str, messages: list[dict], files: list[tuple[str, str]], bot: dict, next_bot: dict | None) -> str:
-    if bot["api_format"] == "image_generation":
+    if not adapter_for(bot).sends_history:
         return image_prompt(messages, bot)
     return make_prompt(group_name, messages, files, bot=bot, next_bot=next_bot)
 
@@ -445,45 +409,142 @@ def bot_instructions(bot: dict) -> str:
     )
 
 
+def _auth_headers(bot: dict, key: str) -> dict[str, str]:
+    headers = bot["extra_headers"].copy()
+    if bot["auth_header"]:
+        headers[bot["auth_header"]] = bot["auth_prefix"] + key
+    return headers
+
+
+class Adapter:
+    """Everything the app needs to know about one API format.
+
+    Code outside the adapters asks these questions instead of comparing format names.
+    """
+
+    sends_history = True  # False: the prompt is only the latest message from another participant.
+    joins_ongoing_talk = True  # False: skip the "keep the conversation going" instruction.
+    joins_workflows = True  # False: cannot return the JSON decisions task workflows need.
+
+    def check(self, bot: dict) -> None:
+        """Raise UserError if this format's own settings are incomplete."""
+
+    def request(self, bot: dict, system: str, prompt: str, key: str, output_limit: int) -> dict:
+        raise NotImplementedError
+
+    def reply_text(self, bot: dict, response: dict) -> object:
+        raise NotImplementedError
+
+    def call(self, bot: dict, system: str, prompt: str, key: str, output_limit: int) -> str | dict:
+        response = _post_json(bot["endpoint"], _auth_headers(bot, key), self.request(bot, system, prompt, key, output_limit), key)
+        try:
+            output = _as_text(self.reply_text(bot, response))
+        except (TypeError, ValueError):
+            raise UserError("The API response could not be read. Check the format and response path.") from None
+        if not output:
+            raise UserError(f"{bot['name']} received no text from its API endpoint.")
+        if len(output) > 100000:
+            raise UserError(f"{bot['name']} returned too much text for a group handoff.")
+        return output
+
+
+class ChatCompletionsAdapter(Adapter):
+    def request(self, bot, system, prompt, key, output_limit):
+        return {"model": bot["model"], "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}], "max_tokens": output_limit}
+
+    def reply_text(self, bot, response):
+        return _at_path(response, "choices.0.message.content")
+
+
+class ResponsesAdapter(Adapter):
+    def request(self, bot, system, prompt, key, output_limit):
+        return {"model": bot["model"], "instructions": system, "input": prompt, "max_output_tokens": output_limit, "store": False}
+
+    def reply_text(self, bot, response):
+        return [part for item in response.get("output", []) if isinstance(item, dict) and item.get("type") == "message"
+                for part in item.get("content", []) if isinstance(part, dict) and part.get("type") == "output_text"]
+
+
+class MessagesAdapter(Adapter):
+    def request(self, bot, system, prompt, key, output_limit):
+        return {"model": bot["model"], "system": system, "messages": [{"role": "user", "content": prompt}], "max_tokens": output_limit}
+
+    def reply_text(self, bot, response):
+        return [part for part in response.get("content", []) if isinstance(part, dict) and part.get("type") == "text"]
+
+
+class CustomAdapter(Adapter):
+    def check(self, bot):
+        if not bot["request_template"] or not bot["response_path"]:
+            raise UserError(f"Add a request template and response path for {bot['name']}.")
+        if not any(token in bot["request_template"] for token in ("{{system}}", "{{prompt}}")):
+            raise UserError("The custom request template must include {{system}} or {{prompt}} so the bot receives its instructions.")
+
+    def request(self, bot, system, prompt, key, output_limit):
+        # Templates without a system field still need the bot's task instructions.
+        custom_prompt = prompt if "{{system}}" in bot["request_template"] else system + "\n\n" + prompt
+        return _replace_template(json.loads(bot["request_template"]), {"model": bot["model"], "system": system, "role": bot["role"], "assignment": bot["assignment"], "prompt": custom_prompt, "api_key": key})
+
+    def reply_text(self, bot, response):
+        return _at_path(response, bot["response_path"])
+
+
+class ImageGenerationAdapter(Adapter):
+    sends_history = False
+    joins_ongoing_talk = False
+    joins_workflows = False
+
+    def call(self, bot, system, prompt, key, output_limit):
+        # DALL-E 2 rejects prompts over 1,000 characters; newer models accept more.
+        prompt = prompt.strip()[:1000 if bot["model"] == "dall-e-2" else 4000]
+        headers = _auth_headers(bot, key)
+        response = _post_json(bot["endpoint"], headers, {"model": bot["model"], "prompt": prompt, "n": 1}, key, allow_list=True)
+        # Open WebUI returns a list of file links; OpenAI returns {"data": [...]}.
+        items = response if isinstance(response, list) else response.get("data")
+        first = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else {}
+        if isinstance(first.get("b64_json"), str):
+            try:
+                data = base64.b64decode(first["b64_json"], validate=True)
+            except (binascii.Error, ValueError):
+                raise UserError(f"{bot['name']} received an unreadable image.") from None
+        elif isinstance(first.get("url"), str):
+            url = urljoin(bot["endpoint"], first["url"])
+            parsed, origin = urlsplit(url), urlsplit(bot["endpoint"])
+            same_origin = (parsed.scheme, parsed.netloc) == (origin.scheme, origin.netloc)
+            if not same_origin and parsed.scheme != "https":
+                raise UserError(f"{bot['name']} returned an image link that is not HTTPS.")
+            # Send the API key only back to the endpoint's own server.
+            data = _get_bytes(url, headers if same_origin else {}, key)
+        else:
+            raise UserError(f"{bot['name']} received no image from its API endpoint.")
+        kind = image_type(data)
+        if not kind:
+            raise UserError(f"{bot['name']} received a file that is not a supported image.")
+        return {"text": prompt, "image": data, "image_type": kind}
+
+
+ADAPTERS: dict[str, Adapter] = {
+    "chat_completions": ChatCompletionsAdapter(),
+    "responses": ResponsesAdapter(),
+    "messages": MessagesAdapter(),
+    "custom": CustomAdapter(),
+    "image_generation": ImageGenerationAdapter(),
+}
+
+
+def adapter_for(bot: dict) -> Adapter:
+    try:
+        return ADAPTERS[bot["api_format"]]
+    except KeyError:
+        raise UserError("Choose a supported API format.") from None
+
+
 def call_bot(bot: dict, prompt: str, key: str, *, instruction_context: str = "") -> str | dict:
-    if bot["api_format"] == "image_generation":
-        return generate_image(bot, prompt, key)
     validate_runnable(bot, key)
     system = bot_instructions(bot)
     if instruction_context:
         system += "\n\n" + instruction_context
-    api_format = bot["api_format"]
-    output_limit = 4096 if instruction_context else 1600
-    if api_format == "chat_completions":
-        body = {"model": bot["model"], "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}], "max_tokens": output_limit}
-    elif api_format == "responses":
-        body = {"model": bot["model"], "instructions": system, "input": prompt, "max_output_tokens": output_limit, "store": False}
-    elif api_format == "messages":
-        body = {"model": bot["model"], "system": system, "messages": [{"role": "user", "content": prompt}], "max_tokens": output_limit}
-    else:
-        # Templates without a system field still need the bot's task instructions.
-        custom_prompt = prompt if "{{system}}" in bot["request_template"] else system + "\n\n" + prompt
-        body = _replace_template(json.loads(bot["request_template"]), {"model": bot["model"], "system": system, "role": bot["role"], "assignment": bot["assignment"], "prompt": custom_prompt, "api_key": key})
-    headers = bot["extra_headers"].copy()
-    if bot["auth_header"]:
-        headers[bot["auth_header"]] = bot["auth_prefix"] + key
-    response = _post_json(bot["endpoint"], headers, body, key)
-    try:
-        if api_format == "chat_completions":
-            output = _as_text(_at_path(response, "choices.0.message.content"))
-        elif api_format == "responses":
-            output = _as_text([part for item in response.get("output", []) if isinstance(item, dict) and item.get("type") == "message" for part in item.get("content", []) if isinstance(part, dict) and part.get("type") == "output_text"])
-        elif api_format == "messages":
-            output = _as_text([part for part in response.get("content", []) if isinstance(part, dict) and part.get("type") == "text"])
-        else:
-            output = _as_text(_at_path(response, bot["response_path"]))
-    except (TypeError, ValueError):
-        raise UserError("The API response could not be read. Check the format and response path.") from None
-    if not output:
-        raise UserError(f"{bot['name']} received no text from its API endpoint.")
-    if len(output) > 100000:
-        raise UserError(f"{bot['name']} returned too much text for a group handoff.")
-    return output
+    return adapter_for(bot).call(bot, system, prompt, key, 4096 if instruction_context else 1600)
 
 
 def run_group_round(
@@ -540,7 +601,7 @@ def run_group_conversation(
         bot = bots[turn % len(bots)]
         next_bot = bots[(turn + 1) % len(bots)] if looping or turn + 1 < len(bots) else None
         prompt = turn_prompt(group_name, conversation, files, bot, next_bot)
-        if looping and bot["api_format"] != "image_generation":
+        if looping and adapter_for(bot).joins_ongoing_talk:
             prompt += "\nThis is an ongoing conversation between the bots. Respond to the latest participant's contribution and build on what they said within your assignment. Give one useful reply or relevant follow-up question, then let the next participant speak. Do not repeat earlier material or ask the human to send 'continue'."
         on_turn(bot)
         result: queue.Queue = queue.Queue(maxsize=1)

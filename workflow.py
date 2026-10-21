@@ -9,7 +9,7 @@ import threading
 import uuid
 from typing import Callable
 
-from core import RateLimitError, UserError, call_bot, make_prompt
+from core import RateLimitError, UserError, adapter_for, call_bot, make_prompt
 
 
 class WorkflowStopped(Exception):
@@ -88,7 +88,7 @@ def run_task_workflow(
         raise UserError("Choose a master and at least one different worker.")
     if len({bot["id"] for bot in workers}) != len(workers):
         raise UserError("Each worker must appear only once in the task sequence.")
-    if any(bot["api_format"] == "image_generation" for bot in [master, *workers]):
+    if any(not adapter_for(bot).joins_workflows for bot in [master, *workers]):
         raise UserError("Image generation bots cannot approve or submit workflow results. Use a group conversation for them.")
     stop = stop_event if stop_event is not None else threading.Event()
     conversation = copy.deepcopy(messages)
