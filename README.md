@@ -98,6 +98,19 @@ Both approvals must point to the **same submitted result** before the next worke
 - Each file is read once as a read-only UTF-8 snapshot and sent to the bots in that group. The app never edits files.
 - Limits: 128 KB per file, 512 KB total, 20 files per message.
 
+## Saved API keys
+
+By default a bot's API key lasts until the app stops. To keep keys between sessions, open **Bot setup → Saved API keys → Set up passphrase**:
+
+- Keys are encrypted (Fernet) with a random data key, which is locked by your passphrase (scrypt, N=2^15) and by a one-time **recovery code** shown once at setup. Neither the passphrase nor a readable key is ever stored or synced.
+- After signing in or restarting, unlock once with your passphrase. Keys stay unlocked until you sign out or the app stops. Wrong attempts wait 1, 2, 4… seconds.
+- **Remember on this device** lets this computer unlock by itself, using a secret file in `.local/` that never syncs.
+- Each bot's key box offers **Remember this key**, **Replace key**, and **Remove key**. Settings offer **Change passphrase**, **New recovery code**, **Forget this device**, and **Reset**.
+- With Supabase, only encrypted tokens sync, so saved keys unlock on any computer where you sign in with your passphrase.
+- If you lose both the passphrase and the recovery code, saved keys cannot be recovered; reset and paste them again.
+
+This needs the `cryptography` package (`python3 -m pip install cryptography`). Without it, keys work for one session as before.
+
 ## Optional: Supabase accounts
 
 By default everything is saved on your computer and no setup is needed. To keep bots and chats in a Supabase account instead, so each person signs in and sees only their own data:
@@ -115,7 +128,7 @@ If the account is empty and this computer has local data, the app offers to impo
 ## Security and privacy
 
 - The server binds to `127.0.0.1` only and requires a random launch token.
-- **API keys live in server memory only.** Re-enter them after a restart.
+- **API keys are readable only in server memory.** Saved keys are stored encrypted and unlock with your passphrase; unsaved keys are gone after a restart.
 - Without Supabase, bot settings, chat history, run history, and allowed file paths are stored in a SQLite database, `.local/app.db`, with owner-only permissions. Git ignores `.local/` and `.env`. An older `.local/settings.json` is imported once on first start and left in place as a backup.
 - The server keeps only the latest 200 messages per group in memory. Older messages stay in storage and load a page at a time.
 - With Supabase, bots, chats, and generated images are sent to your Supabase project, protected by row-level security. Allowed file paths stay in `.local/grants.json`.

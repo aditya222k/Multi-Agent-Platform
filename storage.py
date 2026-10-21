@@ -27,6 +27,8 @@ RECENT_RUNS = 30
 UPSERT = {"Prefer": "resolution=merge-duplicates,return=minimal"}
 IMAGE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
 MESSAGE_COLUMNS = "id,sender,bot_id,text,image,files,created_at"
+# The column that identifies a row, for tables where it is not "id".
+ROW_KEYS = {"bot_keys": "bot_id", "key_protection": "owner_id"}
 # Outbox sync: send every SYNC_INTERVAL seconds, or at once when BATCH_SIZE changes are waiting.
 SYNC_INTERVAL = 10
 BATCH_SIZE = 100
@@ -169,6 +171,7 @@ class SQLiteStore:
         create index if not exists messages_by_group on messages (group_id, seq);
         create table if not exists runs (id text primary key, created_at real not null default 0, data text not null);
         create table if not exists grants (path text primary key);
+        create table if not exists bot_keys (bot_id text primary key, token text not null, hint text not null, saved_at text not null);
     """
 
     def __init__(self, path: Path, images_dir: Path):
@@ -215,6 +218,20 @@ class SQLiteStore:
     def set_meta(self, key: str, value: str) -> None:
         self._write([("insert into meta (key, value) values (?, ?) on conflict (key) do update set value = excluded.value", (key, value))])
 
+    def put_protection(self, protection: dict) -> None:
+        self.set_meta("key_protection", json.dumps(protection))
+
+    def delete_protection(self) -> None:
+        self._write([("delete from meta where key = 'key_protection'", ())])
+
+    def put_bot_key(self, bot_id: str, record: dict) -> None:
+        self._write([("insert into bot_keys (bot_id, token, hint, saved_at) values (?, ?, ?, ?) on conflict (bot_id) do update set "
+                      "token = excluded.token, hint = excluded.hint, saved_at = excluded.saved_at",
+                      (bot_id, record["token"], record["hint"], record["saved_at"]))])
+
+    def delete_bot_key(self, bot_id: str) -> None:
+        self._write([("delete from bot_keys where bot_id = ?", (bot_id,))])
+
     def has_data(self) -> bool:
         return bool(self._read("select exists (select 1 from bots) or exists (select 1 from messages)")[0][0])
 
@@ -231,7 +248,11 @@ class SQLiteStore:
             groups.append({**json.loads(data), "id": group_id, "messages": [json.loads(row[0]) for row in reversed(recent)], "message_count": count})
         grants = [row[0] for row in self._read("select path from grants order by rowid")]
         runs = [json.loads(row[0]) for row in reversed(self._read("select data from runs order by created_at desc limit ?", (RECENT_RUNS,)))]
-        return {"bots": bots, "groups": groups, "grants": grants, "runs": runs}
+        protection = self.get_meta("key_protection")
+        bot_keys = {bot_id: {"token": token, "hint": hint, "saved_at": saved_at}
+                    for bot_id, token, hint, saved_at in self._read("select bot_id, token, hint, saved_at from bot_keys")}
+        return {"bots": bots, "groups": groups, "grants": grants, "runs": runs,
+                "key_protection": json.loads(protection) if protection else None, "bot_keys": bot_keys}
 
     def load_messages(self, group_id: str, before_id: str, limit: int) -> tuple[list[dict], bool]:
         """Up to limit messages older than before_id, oldest first, and whether even older ones exist."""
@@ -248,7 +269,7 @@ class SQLiteStore:
         self._write([("insert into bots (id, data) values (?, ?) on conflict (id) do update set data = excluded.data", self._bot_row(bot))])
 
     def delete_bot(self, bot_id: str) -> None:
-        self._write([("delete from bots where id = ?", (bot_id,))])
+        self._write([("delete from bot_keys where bot_id = ?", (bot_id,)), ("delete from bots where id = ?", (bot_id,))])
 
     def put_group(self, group: dict) -> None:
         self._write([("insert into groups (id, data) values (?, ?) on conflict (id) do update set data = excluded.data", self._group_row(group))])
@@ -271,6 +292,7 @@ class SQLiteStore:
         statements: list[tuple[str, tuple]] = []
         bot_ids, group_ids = [bot["id"] for bot in bots], [group["id"] for group in groups]
         statements.append((f"delete from bots where id not in ({','.join('?' * len(bot_ids))})", tuple(bot_ids)))
+        statements.append((f"delete from bot_keys where bot_id not in ({','.join('?' * len(bot_ids))})", tuple(bot_ids)))
         statements.append((f"delete from messages where group_id not in ({','.join('?' * len(group_ids))})", tuple(group_ids)))
         statements.append((f"delete from groups where id not in ({','.join('?' * len(group_ids))})", tuple(group_ids)))
         statements += [("insert into bots (id, data) values (?, ?) on conflict (id) do update set data = excluded.data", self._bot_row(bot)) for bot in bots]
@@ -501,7 +523,21 @@ class SupabaseStore:
             if error.status == 404 or "does not exist" in str(error) or "schema cache" in str(error):
                 raise SupabaseError(error.status, "The Supabase tables are missing. Run supabase/schema.sql in the Supabase SQL editor first.") from None
             raise
-        return {"bots": bots, "groups": groups, "grants": self._read_grants(), "runs": self._recent_runs()}
+        protection, bot_keys = self._saved_keys()
+        return {"bots": bots, "groups": groups, "grants": self._read_grants(), "runs": self._recent_runs(),
+                "key_protection": protection, "bot_keys": bot_keys}
+
+    def _saved_keys(self) -> tuple[dict | None, dict]:
+        try:
+            protection = json.loads(self._request("GET", "/rest/v1/key_protection", params={"select": "data", "limit": 1}))
+            rows = json.loads(self._request("GET", "/rest/v1/bot_keys", params={"select": "bot_id,token,hint,saved_at"}))
+        except SupabaseError as error:
+            # Accounts created before saved keys existed can still sign in; keys then last one session.
+            self.notice = f"Saved API keys are unavailable: run supabase/schema.sql again in the Supabase SQL editor. ({error})"
+            return None, {}
+        record = protection[0]["data"] if protection and isinstance(protection[0], dict) else None
+        return record, {row["bot_id"]: {"token": row["token"], "hint": row["hint"], "saved_at": row["saved_at"]}
+                        for row in rows if isinstance(row, dict) and row.get("token")}
 
     def _message_counts(self) -> dict[str, int]:
         try:
@@ -540,7 +576,7 @@ class SupabaseStore:
         return grants if isinstance(grants, list) else []
 
     def _upsert(self, table: str, row: dict) -> None:
-        self.outbox.add("upsert", table, row["id"], json.dumps(row, ensure_ascii=False).encode("utf-8"), merge=True)
+        self.outbox.add("upsert", table, row[ROW_KEYS.get(table, "id")], json.dumps(row, ensure_ascii=False).encode("utf-8"), merge=True)
         self._changed()
 
     def _changed(self) -> None:
@@ -553,6 +589,21 @@ class SupabaseStore:
 
     def delete_bot(self, bot_id: str) -> None:
         self.outbox.add("delete", "bots", bot_id, b"")
+        self._changed()
+
+    def put_protection(self, protection: dict) -> None:
+        self._upsert("key_protection", {"owner_id": self.user_id, "data": protection, "updated_at": datetime.now(timezone.utc).isoformat()})
+
+    def delete_protection(self) -> None:
+        self.outbox.add("delete", "key_protection", self.user_id, b"")
+        self._changed()
+
+    def put_bot_key(self, bot_id: str, record: dict) -> None:
+        # Only the encrypted token, the last four characters, and the date ever leave this computer.
+        self._upsert("bot_keys", {"owner_id": self.user_id, "bot_id": bot_id, **record})
+
+    def delete_bot_key(self, bot_id: str) -> None:
+        self.outbox.add("delete", "bot_keys", bot_id, b"")
         self._changed()
 
     def put_group(self, group: dict) -> None:
@@ -681,10 +732,12 @@ class SupabaseStore:
             rows = {}
             for entry in batch:
                 row = json.loads(entry["payload"])
-                rows[row["id"]] = row
-            self._request("POST", f"/rest/v1/{first['target']}", params={"on_conflict": "owner_id,id"}, body=list(rows.values()), headers=UPSERT)
+                rows[entry["key"]] = row
+            key_column = ROW_KEYS.get(first["target"], "id")
+            conflict = "owner_id" if key_column == "owner_id" else f"owner_id,{key_column}"
+            self._request("POST", f"/rest/v1/{first['target']}", params={"on_conflict": conflict}, body=list(rows.values()), headers=UPSERT)
         elif first["kind"] == "delete":
-            self._request("DELETE", f"/rest/v1/{first['target']}", params={"id": f"eq.{first['key']}"})
+            self._request("DELETE", f"/rest/v1/{first['target']}", params={ROW_KEYS.get(first["target"], "id"): f"eq.{first['key']}"})
         else:
             self._request("POST", first["target"], data=bytes(first["payload"]), headers={"Content-Type": first["content_type"], "x-upsert": "true"})
 

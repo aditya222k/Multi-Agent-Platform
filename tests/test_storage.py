@@ -25,7 +25,7 @@ class FakeSupabase:
 
     def __init__(self, password="secret"):
         self.password = password
-        self.tables = {"bots": [], "groups": [], "messages": [], "runs": []}
+        self.tables = {"bots": [], "groups": [], "messages": [], "runs": [], "bot_keys": [], "key_protection": []}
         self.missing = set()
         self.reject = set()
         self.down = False
@@ -66,6 +66,10 @@ class FakeSupabase:
         raise AssertionError(f"Unexpected request {method} {url}")
 
     @staticmethod
+    def identity(row):
+        return row["owner_id"], row.get("id", row.get("bot_id"))
+
+    @staticmethod
     def matches(row, key, value):
         operator, _, operand = value.partition(".")
         if operator == "eq":
@@ -97,10 +101,10 @@ class FakeSupabase:
             body = json.loads(data)
             batch = body if isinstance(body, list) else [body]
             # Like Postgres, one bad row fails the whole statement.
-            if any(row["id"] in self.reject for row in batch):
+            if any(self.identity(row)[1] in self.reject for row in batch):
                 raise storage.SupabaseError(400, "Simulated rejected row")
             for row in batch:
-                existing = next((item for item in rows if item["owner_id"] == row["owner_id"] and item["id"] == row["id"]), None)
+                existing = next((item for item in rows if self.identity(item) == self.identity(row)), None)
                 if existing:
                     existing.update(row)
                 else:
@@ -109,10 +113,15 @@ class FakeSupabase:
             self.posts.append((table, len(batch)))
             return b""
         if method == "DELETE":
-            target = query["id"].removeprefix("eq.")
-            self.tables[table] = [row for row in rows if row["id"] != target]
-            if table == "groups":
-                self.tables["messages"] = [row for row in self.tables["messages"] if row["group_id"] != target]
+            filters = {key: value for key, value in query.items() if "." in value}
+            removed = [row for row in rows if all(self.matches(row, key, value) for key, value in filters.items())]
+            self.tables[table] = [row for row in rows if row not in removed]
+            # Like the schema's foreign keys, deleting a group or bot removes what belongs to it.
+            for row in removed:
+                if table == "groups":
+                    self.tables["messages"] = [item for item in self.tables["messages"] if item["group_id"] != row["id"]]
+                if table == "bots":
+                    self.tables["bot_keys"] = [item for item in self.tables["bot_keys"] if item["bot_id"] != row["id"]]
             return b""
         raise AssertionError(method)
 

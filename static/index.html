@@ -20,6 +20,7 @@
     </header>
 
     <div id="notice" class="notice" role="status" hidden></div>
+    <dialog id="vault-dialog" class="vault-dialog" aria-labelledby="vault-title"><form id="vault-form"></form></dialog>
 
     <main id="login-page" class="page login-page" hidden>
       <form id="login-form" class="login-card">
@@ -42,6 +43,10 @@
         <div><h1>Bots</h1><p class="subtitle">Give each bot a role, an assignment, and its own model connection. Add it to any group chat.</p></div>
         <button id="new-bot" class="button primary" type="button">New bot</button>
       </div>
+      <section id="vault-card" class="vault-card" aria-label="Saved API keys">
+        <div class="vault-text"><strong>Saved API keys</strong><p id="vault-summary"></p></div>
+        <div id="vault-actions" class="vault-actions"></div>
+      </section>
       <div class="workspace-grid">
         <aside class="rail-panel" aria-label="Bots">
           <div class="rail-title"><strong>All bots</strong><span id="bot-count" class="count">0</span></div>
@@ -68,7 +73,7 @@
               <label class="field wide">Request JSON template <span class="field-help">Use {{model}}, {{system}}, {{prompt}}, {{role}}, {{assignment}}, or {{api_key}}</span><textarea id="bot-template" rows="5" spellcheck="false" placeholder='{"model":"{{model}}","prompt":"{{prompt}}"}'></textarea></label>
               <label class="field wide">Response text path <span class="field-help">Dot path such as choices.0.message.content</span><input id="bot-response-path" spellcheck="false" placeholder="output.text"></label>
             </div>
-            <div class="key-box"><div><strong>API key for this bot</strong><p>Held in memory until the local server stops. Leave the key header empty for an API that needs no key.</p></div><div class="key-row"><input id="bot-key" type="password" autocomplete="off" placeholder="Paste a key for this bot"><button id="save-key" class="button secondary" type="button">Set key</button></div></div>
+            <div class="key-box"><div><strong>API key for this bot</strong><p id="key-saved-line"></p><p>Leave the key header empty for an API that needs no key.</p></div><div class="key-controls"><div class="key-row"><input id="bot-key" type="password" autocomplete="off" placeholder="Paste a key for this bot"><button id="save-key" class="button secondary" type="button">Set key</button></div><div class="key-options"><label class="check" id="remember-key-label"><input id="remember-key" type="checkbox"> Remember this key</label><button id="remove-key" class="link-button danger-link" type="button" hidden>Remove key</button></div></div></div>
             </div>
             <div class="form-section"><div class="section-head"><h3>Group chats</h3><span class="section-note">Choose where this bot joins</span></div><div id="bot-groups" class="toggle-list"></div></div>
             <div class="editor-actions"><button id="save-bot" class="button primary" type="button">Save bot</button><button id="delete-bot" class="button danger-text" type="button">Remove bot</button></div>

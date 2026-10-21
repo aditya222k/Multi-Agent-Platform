@@ -62,10 +62,31 @@ create table if not exists public.runs (
 
 create index if not exists runs_recent on public.runs (owner_id, updated_at desc);
 
+-- Saved API keys, encrypted on the user's computer before they are sent. Only the token,
+-- the last four characters, and the save date are stored; the passphrase never is.
+create table if not exists public.bot_keys (
+  owner_id uuid not null default auth.uid() references auth.users (id) on delete cascade,
+  bot_id text not null,
+  token text not null,
+  hint text not null default '',
+  saved_at timestamptz not null default now(),
+  primary key (owner_id, bot_id),
+  foreign key (owner_id, bot_id) references public.bots (owner_id, id) on delete cascade
+);
+
+-- The passphrase setup: salts, scrypt settings, and the data key wrapped by the passphrase and the recovery code.
+create table if not exists public.key_protection (
+  owner_id uuid primary key default auth.uid() references auth.users (id) on delete cascade,
+  data jsonb not null,
+  updated_at timestamptz not null default now()
+);
+
 alter table public.bots enable row level security;
 alter table public.groups enable row level security;
 alter table public.messages enable row level security;
 alter table public.runs enable row level security;
+alter table public.bot_keys enable row level security;
+alter table public.key_protection enable row level security;
 
 drop policy if exists "Owners manage their bots" on public.bots;
 create policy "Owners manage their bots" on public.bots for all to authenticated
@@ -81,6 +102,14 @@ create policy "Owners manage their messages" on public.messages for all to authe
 
 drop policy if exists "Owners manage their runs" on public.runs;
 create policy "Owners manage their runs" on public.runs for all to authenticated
+  using (owner_id = (select auth.uid())) with check (owner_id = (select auth.uid()));
+
+drop policy if exists "Owners manage their bot keys" on public.bot_keys;
+create policy "Owners manage their bot keys" on public.bot_keys for all to authenticated
+  using (owner_id = (select auth.uid())) with check (owner_id = (select auth.uid()));
+
+drop policy if exists "Owners manage their key protection" on public.key_protection;
+create policy "Owners manage their key protection" on public.key_protection for all to authenticated
   using (owner_id = (select auth.uid())) with check (owner_id = (select auth.uid()));
 
 -- Generated images: a private bucket with one folder per user (images/<user id>/<file>).

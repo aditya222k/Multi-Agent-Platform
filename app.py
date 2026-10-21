@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from core import UserError, blank_bot, read_allowed_files, run_group_conversation, validate_bot, validate_desktop_file, validate_runnable
 from storage import IMAGE_TYPES, SQLiteStore, SupabaseAuth, SupabaseError, SupabaseStore, load_config
+from vault import DeviceKeys, Vault, VaultLocked
 from workflow import WorkflowBlocked, run_task_workflow
 
 
@@ -235,6 +236,7 @@ class State(Workspace):
         self.stop_events: dict[str, threading.Event] = {}
         self.events = EventHub()
         self.runner = RunManager(MAX_ACTIVE_RUNS)
+        self.vault = Vault()
         self.store: SQLiteStore | SupabaseStore | None = None
         # Set when Supabase is configured; the account is then required before any data loads.
         self.supabase: dict | None = None
@@ -256,6 +258,53 @@ class State(Workspace):
             store.put_group(self.groups[0])
         for run in self.restore_runs(data.get("runs")):
             store.put_run(run)
+        self._open_vault("local", data, SETTINGS_FILE.parent)
+
+    def _open_vault(self, owner: str, data: dict, folder: Path, password: str | None = None) -> None:
+        """Load this account's saved keys; a device that remembers them unlocks straight away."""
+        opened = self.vault.reset(owner, data.get("key_protection"), data.get("bot_keys") or {}, DeviceKeys(folder), password)
+        known = {bot["id"] for bot in self.bots}
+        self.keys.update({bot_id: key for bot_id, key in opened.items() if bot_id in known})
+
+    def vault_action(self, action: str, body: dict) -> dict:
+        """Set up, unlock, lock, or change how saved keys are protected. Readable keys never leave memory."""
+        store = self.require_store()
+        result: dict = {}
+        if action == "setup":
+            protection, code = self.vault.setup(body.get("passphrase"), body.get("remember") is True)
+            store.put_protection(protection)
+            result["recovery_code"] = code  # Shown once; it is not stored anywhere readable.
+        elif action == "unlock":
+            recovery = body.get("recovery_code")
+            # scrypt runs here, outside the state lock, so other requests are not held up.
+            opened = self.vault.unlock(body.get("passphrase"), recovery, body.get("remember") is True)
+            with self.lock:
+                known = {bot["id"] for bot in self.bots}
+                self.keys.update({bot_id: key for bot_id, key in opened.items() if bot_id in known})
+            result["used_recovery_code"] = isinstance(recovery, str) and bool(recovery.strip())
+        elif action == "lock":
+            with self.lock:
+                for bot_id in self.vault.lock():
+                    self.keys.pop(bot_id, None)
+        elif action == "change":
+            store.put_protection(self.vault.change_passphrase(body.get("passphrase")))
+        elif action == "recovery":
+            protection, code = self.vault.new_recovery_code()
+            store.put_protection(protection)
+            result["recovery_code"] = code
+        elif action == "forget-device":
+            self.vault.forget_device()
+        elif action == "reset":
+            if body.get("confirm") is not True:
+                raise UserError("Confirm that every saved key should be deleted.")
+            with self.lock:
+                for bot_id in self.vault.clear():
+                    store.delete_bot_key(bot_id)
+                    self.keys.pop(bot_id, None)
+                store.delete_protection()
+        else:
+            raise UserError("Unknown saved-key action.")
+        return result
 
     def save(self) -> None:
         """Write the whole workspace. Normal changes are saved one at a time through the store."""
@@ -273,6 +322,7 @@ class State(Workspace):
                 "account": {"mode": "supabase" if self.supabase else "local", "email": getattr(self.store, "email", "")},
                 "sync_error": getattr(self.store, "error", ""),
                 "sync": self.store.sync_status() if isinstance(self.store, SupabaseStore) else {"state": "local"},
+                "vault": self.vault.status(),
             })
 
     def restore_runs(self, raw: object) -> list[dict]:
@@ -339,6 +389,7 @@ class State(Workspace):
             event.set()
         self.bots, self.groups, self.grants = [], [], []
         self.keys, self.runs = {}, {}
+        self.vault.reset("", None, {}, None)
 
     def use_supabase(self, config: dict) -> None:
         """Keep data in a Supabase account; nothing loads until someone signs in."""
@@ -402,6 +453,7 @@ class State(Workspace):
                 self.groups = [general_group()]
                 store.put_group(self.groups[0])
             self.store = store
+            self._open_vault(session["user_id"], data, GRANTS_FILE.parent, password)
         if isinstance(previous, SupabaseStore):
             previous.close()
 
@@ -672,7 +724,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if not self._require_account():
                 return
-            if parts == ["api", "import-local"]:
+            if len(parts) == 3 and parts[:2] == ["api", "vault"]:
+                result = STATE.vault_action(parts[2], body)
+                self._json(HTTPStatus.OK, {**STATE.public(), **result})
+            elif parts == ["api", "import-local"]:
                 STATE.import_local()
                 self._json(HTTPStatus.OK, STATE.public())
             elif parts == ["api", "bots"]:
@@ -723,7 +778,8 @@ class Handler(BaseHTTPRequestHandler):
             if parts[-1] not in {"send", "stop"}:
                 STATE.events.publish("state", {})
         except UserError as error:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            # The page offers to unlock saved keys when a run needs one that is locked.
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error), **({"vault_locked": True} if isinstance(error, VaultLocked) else {})})
         except subprocess.TimeoutExpired:
             self._json(HTTPStatus.REQUEST_TIMEOUT, {"error": "File selection timed out."})
         except OSError:
@@ -742,11 +798,21 @@ class Handler(BaseHTTPRequestHandler):
                 key = body.get("key")
                 if not isinstance(key, str) or len(key) > 1000 or any(ord(char) < 32 for char in key):
                     raise UserError("Enter a valid API key.")
-                STATE.keys[bot_id] = key.strip()
+                key = key.strip()
+                if body.get("remember") is True and key:
+                    # Encrypted here; only the token, hint, and date are stored or synced.
+                    STATE.require_store().put_bot_key(bot_id, STATE.vault.seal(bot_id, key))
+                STATE.keys[bot_id] = key
+            elif parts == [bot_id, "key", "remove"]:
+                STATE.keys.pop(bot_id, None)
+                if STATE.vault.remove(bot_id):
+                    STATE.require_store().delete_bot_key(bot_id)
             elif parts == [bot_id, "delete"]:
                 store = STATE.require_store()
                 STATE.bots.remove(existing)
                 STATE.keys.pop(bot_id, None)
+                if STATE.vault.remove(bot_id):
+                    store.delete_bot_key(bot_id)
                 for group in STATE.groups:
                     if bot_id in group["bot_ids"] or group.get("master_id") == bot_id:
                         group["bot_ids"] = [item for item in group["bot_ids"] if item != bot_id]
@@ -848,6 +914,9 @@ class Handler(BaseHTTPRequestHandler):
             if (continuous or duration) and len(bots) < 2:
                 raise UserError("Add at least two bots to start a conversation.")
             keys = {bot["id"]: STATE.keys.get(bot["id"], "") for bot in bots}
+            locked = [bot["name"] for bot in bots if not keys[bot["id"]] and bot["id"] in STATE.vault.saved and not STATE.vault.unlocked]
+            if locked:
+                raise VaultLocked(f"Unlock your saved keys to run {', '.join(locked)}.")
             for bot in bots:
                 validate_runnable(bot, keys[bot["id"]])
             files = read_allowed_files(body.get("files", []), STATE.grants)

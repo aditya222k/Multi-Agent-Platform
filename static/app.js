@@ -20,7 +20,11 @@ async function api(path, body) {
   const response = await fetch(path, options);
   const data = await response.json();
   if (response.status === 401 && data.login_required) showLogin();
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  if (!response.ok) {
+    const error = new Error(data.error || `Request failed (${response.status})`);
+    error.data = data;
+    throw error;
+  }
   return data;
 }
 
@@ -179,10 +183,21 @@ function renderBotEditor() {
   $('bot-key').value = '';
   $('custom-fields').hidden = draft.api_format !== 'custom';
   const hasKey = !!state.key_status[bot.id];
-  $('bot-key-status').textContent = hasKey ? 'Key set for session' : 'No key';
+  const vault = vaultState();
+  const saved = vault.saved[bot.id];
+  $('bot-key-status').textContent = hasKey ? (saved ? 'Saved key' : 'Key set for session') : saved ? 'Saved key · locked' : 'No key';
   $('bot-key-status').classList.toggle('ready', hasKey);
-  $('save-key').textContent = hasKey ? 'Replace key' : 'Set key';
+  $('key-saved-line').textContent = saved
+    ? `Saved key ends in …${saved.hint || '····'}, saved ${since(saved.saved_at)}.${vault.unlocked ? '' : ' Unlock saved keys to use it.'}`
+    : hasKey ? 'Set for this session only. It is cleared when the app stops.' : 'Paste a key to use this bot.';
+  const canRemember = vault.available && vault.configured && vault.unlocked;
+  $('remember-key').disabled = !canRemember;
+  $('remember-key').checked = canRemember;
+  $('remember-key-label').title = canRemember ? '' : !vault.available ? 'Install the cryptography package to remember keys.' : !vault.configured ? 'Set up a passphrase for saved keys first.' : 'Unlock saved keys first.';
+  $('remove-key').hidden = !(saved || hasKey);
+  $('save-key').textContent = hasKey || saved ? 'Replace key' : 'Set key';
   renderBotGroups();
+  renderVault();
 }
 
 function switchRow(title, subtitle, checked, onToggle) {
@@ -502,6 +517,7 @@ async function refreshState() {
   state = await api('/api/state');
   renderGroupList(); renderBotGroups(); renderChat(false);
   renderSync(state.sync);
+  renderVault();
   showSyncError();
 }
 
@@ -568,8 +584,11 @@ async function startApp() {
   if (!findGroup(selectedGroupId)) selectedGroupId = state.groups[0]?.id || null;
   navigate(page(), selectedGroupId, false);
   renderSync(state.sync);
+  renderVault();
   showSyncError();
   listen();
+  const vault = vaultState();
+  if (vault.configured && !vault.unlocked && Object.keys(vault.saved).length) openVault('unlock');
 }
 
 async function initialize() {
@@ -664,12 +683,178 @@ $('save-key').addEventListener('click', async () => {
   try {
     stashDraft();
     const key = $('bot-key').value;
-    state = await api(`/api/bots/${selectedBotId}/key`, { key });
+    const remember = !$('remember-key').disabled && $('remember-key').checked;
+    state = await api(`/api/bots/${selectedBotId}/key`, { key, remember });
     $('bot-key').value = '';
     renderBotEditor();
-    notice(key ? 'API key set for this bot and this server session.' : 'API key cleared.');
+    notice(!key ? 'API key cleared.' : remember ? 'API key saved. It is encrypted and unlocks with your passphrase.' : 'API key set for this session.');
+  } catch (error) { if (error.data?.vault_locked) openVault('unlock', error.message); else notice(error.message, true); }
+});
+$('remove-key').addEventListener('click', async () => {
+  const bot = findBot(selectedBotId);
+  if (!bot || !confirm(`Remove the API key for ${bot.name}? A saved copy is deleted too.`)) return;
+  try {
+    state = await api(`/api/bots/${bot.id}/key/remove`, {});
+    renderBotEditor(); renderChat(false);
+    notice('API key removed.');
   } catch (error) { notice(error.message, true); }
 });
+
+function vaultState() {
+  return state.vault || { available: false, configured: false, unlocked: false, remembered: false, saved: {}, min_length: 4 };
+}
+
+function since(iso) {
+  const days = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
+  if (Number.isNaN(days)) return 'earlier';
+  return days < 1 ? 'today' : days === 1 ? 'yesterday' : `${days} days ago`;
+}
+
+function renderVault() {
+  const vault = vaultState();
+  const count = Object.keys(vault.saved).length;
+  const keys = `${count} saved key${count === 1 ? '' : 's'}`;
+  const actions = $('vault-actions');
+  actions.replaceChildren();
+  const add = (label, handler, kind = 'secondary') => {
+    const button = node('button', `button ${kind} small`, label);
+    button.type = 'button';
+    button.addEventListener('click', handler);
+    actions.append(button);
+  };
+  if (!vault.available) {
+    $('vault-summary').textContent = 'Keys last until the app stops. To save them, install the cryptography package: python3 -m pip install cryptography';
+  } else if (!vault.configured) {
+    $('vault-summary').textContent = 'Keys last until the app stops. Set a passphrase to save them encrypted, then unlock once per session.';
+    add('Set up passphrase', () => openVault('setup'), 'primary');
+  } else if (!vault.unlocked) {
+    $('vault-summary').textContent = `${keys} · locked. Unlock once to use them until you sign out.`;
+    add('Unlock', () => openVault('unlock'), 'primary');
+    add('Reset', resetVault, 'danger-text');
+  } else {
+    $('vault-summary').textContent = `${keys} · unlocked until you sign out or the app restarts${vault.remembered ? ' · remembered on this device' : ''}.`;
+    add('Lock', () => vaultCall('lock', {}, 'Saved keys locked.'));
+    add('Change passphrase', () => openVault('change'));
+    add('New recovery code', () => vaultCall('recovery', {}));
+    if (vault.remembered) add('Forget this device', () => vaultCall('forget-device', {}, 'This device no longer unlocks saved keys by itself.'));
+    add('Reset', resetVault, 'danger-text');
+  }
+}
+
+async function vaultCall(action, body, message = '') {
+  const result = await api(`/api/vault/${action}`, body);
+  state = result;
+  renderVault(); renderBotEditor(); renderBotList(); renderChat(false);
+  if (result.recovery_code) showRecoveryCode(result.recovery_code);
+  else if (message) notice(message);
+  return result;
+}
+
+function resetVault() {
+  if (!confirm('Delete your passphrase setup and every saved API key? Bots and chats stay. You will paste keys again.')) return;
+  vaultCall('reset', { confirm: true }, 'Saved keys deleted.').catch((error) => notice(error.message, true));
+}
+
+function field(label, id, type = 'password', autocomplete = 'off') {
+  const wrap = node('label', 'field', label);
+  const input = document.createElement('input');
+  Object.assign(input, { id, type, autocomplete, required: true });
+  wrap.append(input);
+  return wrap;
+}
+
+// One dialog serves every step: set up, unlock, change passphrase, and showing a recovery code.
+function openVault(mode, note = '') {
+  const vault = vaultState();
+  const dialog = $('vault-dialog');
+  const form = $('vault-form');
+  form.replaceChildren();
+  const error = node('p', 'vault-error');
+  error.hidden = true;
+  const buttons = node('div', 'vault-actions-row');
+  const submit = node('button', 'button primary', mode === 'setup' ? 'Save passphrase' : mode === 'unlock' ? 'Unlock' : 'Change passphrase');
+  submit.type = 'submit';
+  const cancel = node('button', 'button secondary', mode === 'unlock' ? 'Later' : 'Cancel');
+  cancel.type = 'button';
+  cancel.addEventListener('click', () => dialog.close());
+  buttons.append(cancel, submit);
+  const remember = node('label', 'check');
+  const rememberBox = document.createElement('input');
+  Object.assign(rememberBox, { type: 'checkbox', id: 'vault-remember' });
+  remember.append(rememberBox, ' Remember on this device, so it unlocks by itself here');
+  let useCode = false;
+
+  if (mode === 'setup') {
+    form.append(node('h2', null, 'Protect saved keys'),
+      node('p', null, `Saved API keys are encrypted with a passphrase only you know. Use at least ${vault.min_length} characters; longer is much harder to guess. You will also get a one-time recovery code.`),
+      field('Passphrase', 'vault-passphrase', 'password', 'new-password'), field('Type it again', 'vault-confirm', 'password', 'new-password'), remember);
+  } else if (mode === 'unlock') {
+    const secret = field('Passphrase', 'vault-passphrase', 'password', 'current-password');
+    const toggle = node('button', 'link-button', 'Use recovery code instead');
+    toggle.type = 'button';
+    toggle.addEventListener('click', () => {
+      useCode = !useCode;
+      secret.firstChild.textContent = useCode ? 'Recovery code' : 'Passphrase';
+      $('vault-passphrase').type = useCode ? 'text' : 'password';
+      $('vault-passphrase').value = '';
+      toggle.textContent = useCode ? 'Use passphrase instead' : 'Use recovery code instead';
+    });
+    form.append(node('h2', null, 'Unlock saved keys'), node('p', null, note || 'Enter your passphrase once. Saved keys stay unlocked until you sign out or the app restarts.'), secret, toggle, remember);
+  } else {
+    form.append(node('h2', null, 'Change passphrase'), node('p', null, note || 'Saved keys stay as they are; only the lock on them changes.'),
+      field('New passphrase', 'vault-passphrase', 'password', 'new-password'), field('Type it again', 'vault-confirm', 'password', 'new-password'));
+  }
+  form.firstChild.id = 'vault-title';
+  form.append(error, buttons);
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const secret = $('vault-passphrase').value;
+    if ($('vault-confirm') && secret !== $('vault-confirm').value) { error.textContent = 'The two passphrases do not match.'; error.hidden = false; return; }
+    submit.disabled = true;
+    try {
+      if (mode === 'setup') {
+        dialog.close();
+        await vaultCall('setup', { passphrase: secret, remember: rememberBox.checked });
+      } else if (mode === 'unlock') {
+        const result = await vaultCall('unlock', useCode ? { recovery_code: secret, remember: rememberBox.checked } : { passphrase: secret, remember: rememberBox.checked });
+        dialog.close();
+        if (result.used_recovery_code) openVault('change', 'Unlocked with your recovery code. Choose a new passphrase now.');
+        else notice('Saved keys unlocked.');
+      } else {
+        await vaultCall('change', { passphrase: secret }, 'Passphrase changed.');
+        dialog.close();
+      }
+    } catch (failure) {
+      if (!dialog.open) dialog.showModal();
+      error.textContent = failure.message;
+      error.hidden = false;
+    } finally { submit.disabled = false; }
+  };
+  if (!dialog.open) dialog.showModal();
+  $('vault-passphrase').focus();
+}
+
+function showRecoveryCode(code) {
+  const dialog = $('vault-dialog');
+  const form = $('vault-form');
+  form.replaceChildren();
+  const copy = node('button', 'button secondary', 'Copy');
+  copy.type = 'button';
+  copy.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(code); copy.textContent = 'Copied'; }
+    catch { notice('Select the code and copy it by hand.', true); }
+  });
+  const done = node('button', 'button primary', 'I saved it');
+  done.type = 'button';
+  done.addEventListener('click', () => dialog.close());
+  const buttons = node('div', 'vault-actions-row');
+  buttons.append(copy, done);
+  form.append(node('h2', null, 'Your recovery code'),
+    node('p', null, 'If you forget your passphrase, this code unlocks your saved keys. It is shown only now; store it somewhere safe, like a password manager. Any earlier code stops working.'),
+    node('div', 'recovery-code', code), buttons);
+  form.onsubmit = (event) => event.preventDefault();
+  if (!dialog.open) dialog.showModal();
+}
 $('delete-bot').addEventListener('click', async () => {
   const bot = findBot(selectedBotId);
   if (!bot || !confirm(`Remove ${bot.name} from all groups? Existing chat messages will stay.`)) return;
@@ -711,7 +896,11 @@ $('send-message').addEventListener('click', async () => {
     selectedFiles.clear();
     // The new message and the run's progress arrive as pushed events.
     renderGrants(); updateAttachedCount();
-  } catch (error) { $('send-message').disabled = false; $('run-error').textContent = error.message; $('run-error').hidden = false; notice(error.message, true); }
+  } catch (error) {
+    $('send-message').disabled = false;
+    if (error.data?.vault_locked) { openVault('unlock', error.message); return; }
+    $('run-error').textContent = error.message; $('run-error').hidden = false; notice(error.message, true);
+  }
 });
 
 async function saveRunSettings() {
