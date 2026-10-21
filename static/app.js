@@ -190,10 +190,12 @@ function renderBotEditor() {
   $('key-saved-line').textContent = saved
     ? `Saved key ends in …${saved.hint || '····'}, saved ${since(saved.saved_at)}.${vault.unlocked ? '' : ' Unlock saved keys to use it.'}`
     : hasKey ? 'Set for this session only. It is cleared when the app stops.' : 'Paste a key to use this bot.';
-  const canRemember = vault.available && vault.configured && vault.unlocked;
-  $('remember-key').disabled = !canRemember;
-  $('remember-key').checked = canRemember;
-  $('remember-key-label').title = canRemember ? '' : !vault.available ? 'Install the cryptography package to remember keys.' : !vault.configured ? 'Set up a passphrase for saved keys first.' : 'Unlock saved keys first.';
+  // Ticking it before a passphrase exists, or while locked, walks through setup or unlock on Set key.
+  $('remember-key').disabled = !vault.available;
+  $('remember-key').checked = vault.available && vault.configured && vault.unlocked;
+  $('remember-key-label').title = !vault.available ? 'Install the cryptography package to remember keys.'
+    : !vault.configured ? 'You will choose a passphrase first, then the key is saved.'
+    : !vault.unlocked ? 'You will unlock saved keys first, then the key is saved.' : 'Saved encrypted; unlocks with your passphrase.';
   $('remove-key').hidden = !(saved || hasKey);
   $('save-key').textContent = hasKey || saved ? 'Replace key' : 'Set key';
   renderBotGroups();
@@ -678,17 +680,29 @@ $('save-bot').addEventListener('click', async () => {
     notice('Bot settings saved.');
   } catch (error) { notice(error.message, true); }
 });
-$('save-key').addEventListener('click', async () => {
-  if (!selectedBotId) return;
+async function saveKey(botId, key, remember) {
   try {
-    stashDraft();
-    const key = $('bot-key').value;
-    const remember = !$('remember-key').disabled && $('remember-key').checked;
-    state = await api(`/api/bots/${selectedBotId}/key`, { key, remember });
+    state = await api(`/api/bots/${botId}/key`, { key, remember });
     $('bot-key').value = '';
     renderBotEditor();
     notice(!key ? 'API key cleared.' : remember ? 'API key saved. It is encrypted and unlocks with your passphrase.' : 'API key set for this session.');
-  } catch (error) { if (error.data?.vault_locked) openVault('unlock', error.message); else notice(error.message, true); }
+  } catch (error) {
+    if (error.data?.vault_locked) openVault('unlock', error.message, () => saveKey(botId, key, remember));
+    else notice(error.message, true);
+  }
+}
+
+$('save-key').addEventListener('click', () => {
+  if (!selectedBotId) return;
+  stashDraft();
+  const botId = selectedBotId;
+  const key = $('bot-key').value;
+  const remember = !$('remember-key').disabled && $('remember-key').checked && !!key.trim();
+  const vault = vaultState();
+  // The key waits here while the person sets up or unlocks, then saves without being pasted again.
+  if (remember && !vault.configured) openVault('setup', '', () => saveKey(botId, key, true));
+  else if (remember && !vault.unlocked) openVault('unlock', '', () => saveKey(botId, key, true));
+  else saveKey(botId, key, remember);
 });
 $('remove-key').addEventListener('click', async () => {
   const bot = findBot(selectedBotId);
@@ -764,7 +778,9 @@ function field(label, id, type = 'password', autocomplete = 'off') {
 }
 
 // One dialog serves every step: set up, unlock, change passphrase, and showing a recovery code.
-function openVault(mode, note = '') {
+let afterRecoveryCode = null;
+
+function openVault(mode, note = '', onDone = null) {
   const vault = vaultState();
   const dialog = $('vault-dialog');
   const form = $('vault-form');
@@ -776,7 +792,10 @@ function openVault(mode, note = '') {
   submit.type = 'submit';
   const cancel = node('button', 'button secondary', mode === 'unlock' ? 'Later' : 'Cancel');
   cancel.type = 'button';
-  cancel.addEventListener('click', () => dialog.close());
+  cancel.addEventListener('click', () => {
+    dialog.close();
+    if (onDone) notice('The key was not saved. Set it again when you are ready.', true);
+  });
   buttons.append(cancel, submit);
   const remember = node('label', 'check');
   const rememberBox = document.createElement('input');
@@ -814,12 +833,14 @@ function openVault(mode, note = '') {
     try {
       if (mode === 'setup') {
         dialog.close();
+        afterRecoveryCode = onDone;  // Runs once the person confirms they saved the recovery code.
         await vaultCall('setup', { passphrase: secret, remember: rememberBox.checked });
       } else if (mode === 'unlock') {
         const result = await vaultCall('unlock', useCode ? { recovery_code: secret, remember: rememberBox.checked } : { passphrase: secret, remember: rememberBox.checked });
         dialog.close();
+        if (onDone) await onDone();
         if (result.used_recovery_code) openVault('change', 'Unlocked with your recovery code. Choose a new passphrase now.');
-        else notice('Saved keys unlocked.');
+        else if (!onDone) notice('Saved keys unlocked.');
       } else {
         await vaultCall('change', { passphrase: secret }, 'Passphrase changed.');
         dialog.close();
@@ -846,7 +867,12 @@ function showRecoveryCode(code) {
   });
   const done = node('button', 'button primary', 'I saved it');
   done.type = 'button';
-  done.addEventListener('click', () => dialog.close());
+  done.addEventListener('click', () => {
+    dialog.close();
+    const next = afterRecoveryCode;
+    afterRecoveryCode = null;
+    if (next) next();
+  });
   const buttons = node('div', 'vault-actions-row');
   buttons.append(copy, done);
   form.append(node('h2', null, 'Your recovery code'),
