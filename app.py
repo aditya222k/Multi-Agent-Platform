@@ -272,6 +272,7 @@ class State(Workspace):
                 "runs": list(self.runs.values())[-30:][::-1],
                 "account": {"mode": "supabase" if self.supabase else "local", "email": getattr(self.store, "email", "")},
                 "sync_error": getattr(self.store, "error", ""),
+                "sync": self.store.sync_status() if isinstance(self.store, SupabaseStore) else {"state": "local"},
             })
 
     def restore_runs(self, raw: object) -> list[dict]:
@@ -378,8 +379,10 @@ class State(Workspace):
         if not isinstance(email, str) or not isinstance(password, str) or not email.strip() or not password or len(email) > 320 or len(password) > 1000:
             raise UserError("Enter your email and password.")
         session = SupabaseAuth(self.supabase).sign_in(email.strip(), password)
-        store = SupabaseStore(self.supabase, session, GRANTS_FILE)
+        store = SupabaseStore(self.supabase, session, GRANTS_FILE, on_status=lambda status: self.events.publish("sync", status))
         try:
+            # Changes left in the outbox by an earlier session go first, so the load below includes them.
+            store.flush(20)
             data = store.load(HISTORY_WINDOW)  # Network reads stay outside the state lock.
             account = Workspace()
             account.apply(data)
@@ -402,15 +405,18 @@ class State(Workspace):
         if isinstance(previous, SupabaseStore):
             previous.close()
 
-    def sign_out(self) -> None:
+    def sign_out(self) -> int:
+        """Sign out after sending what can be sent. Returns how many changes wait on this computer."""
         with self.lock:
             store, self.store = self.store, None
             self._clear()
         # Wakes open event streams so they notice the sign-out and close.
         self.events.publish("session", {})
+        waiting = 0
         if isinstance(store, SupabaseStore):
-            store.close()
+            waiting = store.close()
             SupabaseAuth(self.supabase).sign_out(store.session)
+        return waiting
 
     def import_local(self) -> None:
         """Copy this computer's saved bots, chats, and images into the signed-in, still-empty account."""
@@ -661,8 +667,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, STATE.session())
                 return
             if parts == ["api", "logout"]:
-                STATE.sign_out()
-                self._json(HTTPStatus.OK, STATE.session())
+                waiting = STATE.sign_out()
+                self._json(HTTPStatus.OK, {**STATE.session(), "unsynced": waiting})
                 return
             if not self._require_account():
                 return

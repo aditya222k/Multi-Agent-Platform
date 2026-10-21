@@ -164,6 +164,9 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 .message-head span{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
 .message-bubble{white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:1.6;padding:1px 0 1px 14px;border-left:2px solid var(--v,var(--line-strong))}
 .account{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px;white-space:nowrap}
+.sync-pill{padding:2px 8px;border-radius:999px;background:var(--ok-soft);color:var(--ok);font-weight:600}
+.sync-pill.saving{background:var(--accent-soft);color:var(--accent)}
+.sync-pill.offline,.sync-pill.failed{background:var(--warn-soft);color:var(--warn)}
 .login-page{display:flex;justify-content:center}
 .login-card{width:min(100%,420px);display:grid;gap:16px;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:28px 32px;margin-top:24px}
 .login-card h1{margin:0;font-size:24px}.login-card .subtitle{margin:0}

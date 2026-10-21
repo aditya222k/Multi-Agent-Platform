@@ -108,6 +108,8 @@ By default everything is saved on your computer and no setup is needed. To keep 
 4. Copy `.env.example` to `.env` and fill in the **Project URL** and **publishable (anon) key** from **Project Settings → API**. Never use the secret / `service_role` key.
 5. Run `python3 app.py` and sign in.
 
+Changes are saved to an outbox on this computer (`.local/outbox.db`) first, then sent to Supabase in batches every few seconds. If Supabase does not respond, nothing is lost: new changes keep collecting in the outbox and are sent, in order, as soon as it answers again, including after a restart or the next sign-in. The top bar shows **All changes saved**, **Saving…**, or **Offline · N waiting**. A change Supabase rejects outright is set aside and reported so it cannot block the rest.
+
 If the account is empty and this computer has local data, the app offers to import it. API keys and Desktop file permissions stay on your computer either way. Delete `.env` to go back to local storage.
 
 ## Security and privacy

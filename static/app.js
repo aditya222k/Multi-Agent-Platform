@@ -43,8 +43,22 @@ function showAccount(session) {
   if (session.mode === 'supabase') $('footer-note').textContent = 'Bots and chats are saved to your Supabase account. API keys and Desktop file permissions stay on this computer.';
 }
 
+let shownSyncError = '';
+// Shown once per distinct problem, not on every update while it lasts.
 function showSyncError() {
-  if (state.sync_error) notice(state.sync_error, true);
+  if (state.sync_error && state.sync_error !== shownSyncError) notice(state.sync_error, true);
+  shownSyncError = state.sync_error || '';
+}
+
+function renderSync(status) {
+  const pill = $('sync-status');
+  pill.hidden = !status || status.state === 'local';
+  if (pill.hidden) return;
+  const waiting = `${status.pending} change${status.pending === 1 ? '' : 's'}`;
+  pill.textContent = status.state === 'offline' ? `Offline · ${waiting} waiting` : status.state === 'saving' ? `Saving ${waiting}…` : 'All changes saved';
+  if (status.failed) pill.textContent += ` · ${status.failed} not saved`;
+  pill.className = `sync-pill ${status.failed ? 'failed' : status.state}`;
+  pill.title = status.state === 'offline' ? `Supabase is not responding. Changes are kept on this computer and sent when it answers. (${status.reason})` : '';
 }
 
 function notice(message, error = false) {
@@ -487,6 +501,7 @@ function addMessage(groupId, message) {
 async function refreshState() {
   state = await api('/api/state');
   renderGroupList(); renderBotGroups(); renderChat(false);
+  renderSync(state.sync);
   showSyncError();
 }
 
@@ -503,8 +518,9 @@ function applyRun({ run, sync_error: syncError }) {
   const index = state.runs.findIndex((item) => item.id === run.id);
   const previous = index >= 0 ? state.runs[index] : null;
   if (index >= 0) state.runs[index] = run; else state.runs.unshift(run);
+  state.sync_error = syncError;
   if (isActive(previous) && ['failed', 'blocked'].includes(run.status)) notice(run.error, true);
-  else if (syncError) notice(syncError, true);
+  else showSyncError();
   renderGroupList();
   const selected = latestRun(selectedGroupId);
   if (page() === 'chats' && (run.group_id === selectedGroupId || selected?.status === 'queued')) { updateGroupSummary(); renderMessages(); renderGroupMembers(); }
@@ -528,6 +544,7 @@ function listen() {
   source.addEventListener('run', handle(applyRun));
   source.addEventListener('state', () => refreshState().catch((error) => notice(error.message, true)));
   source.addEventListener('resync', resync);
+  source.addEventListener('sync', handle((status) => { state.sync = status; renderSync(status); }));
   source.addEventListener('error', async () => {
     // The browser retries dropped connections itself; a refused stream usually means the session ended.
     if (source.readyState !== EventSource.CLOSED || events !== source) return;
@@ -550,6 +567,7 @@ async function startApp() {
   selectedBotId = state.bots[0]?.id || null;
   if (!findGroup(selectedGroupId)) selectedGroupId = state.groups[0]?.id || null;
   navigate(page(), selectedGroupId, false);
+  renderSync(state.sync);
   showSyncError();
   listen();
 }
@@ -599,8 +617,13 @@ $('skip-import').addEventListener('click', async () => {
   catch (error) { notice(error.message, true); }
 });
 $('sign-out').addEventListener('click', async () => {
-  try { await api('/api/logout', {}); }
-  finally { state = { bots: [], groups: [], grants: [], key_status: {}, runs: [] }; showLogin(); }
+  let waiting = 0;
+  try { waiting = (await api('/api/logout', {})).unsynced || 0; }
+  finally {
+    state = { bots: [], groups: [], grants: [], key_status: {}, runs: [] };
+    showLogin();
+    if (waiting) notice(`${waiting} change${waiting === 1 ? '' : 's'} could not reach Supabase yet. They are saved on this computer and will be sent the next time you sign in.`, true);
+  }
 });
 
 $('nav-bots').addEventListener('click', () => { if (page() === 'chats') navigate('bots'); });

@@ -27,6 +27,9 @@ class FakeSupabase:
         self.password = password
         self.tables = {"bots": [], "groups": [], "messages": [], "runs": []}
         self.missing = set()
+        self.reject = set()
+        self.down = False
+        self.posts = []
         self.objects = {}
         self.calls = []
         self.fail_next = None
@@ -36,6 +39,8 @@ class FakeSupabase:
         parts = urlsplit(url)
         query = {key: values[0] for key, values in parse_qs(parts.query).items()}
         self.calls.append((method, parts.path, query))
+        if self.down and parts.path.startswith(("/rest/", "/storage/")):
+            raise storage.SupabaseError(0, "Could not reach Supabase. Check your internet connection.")
         if self.fail_next:
             status, self.fail_next = self.fail_next, None
             raise storage.SupabaseError(status, "Simulated failure")
@@ -89,13 +94,19 @@ class FakeSupabase:
             columns = query["select"].split(",")
             return json.dumps([{column: row.get(column) for column in columns} for row in rows[offset:offset + limit]]).encode()
         if method == "POST":
-            row = json.loads(data)
-            existing = next((item for item in rows if item["owner_id"] == row["owner_id"] and item["id"] == row["id"]), None)
-            if existing:
-                existing.update(row)
-            else:
-                self.sequence += 1
-                rows.append({**row, "seq": self.sequence, "created_at": row.get("created_at", "2026-10-20T12:00:00+00:00")})
+            body = json.loads(data)
+            batch = body if isinstance(body, list) else [body]
+            # Like Postgres, one bad row fails the whole statement.
+            if any(row["id"] in self.reject for row in batch):
+                raise storage.SupabaseError(400, "Simulated rejected row")
+            for row in batch:
+                existing = next((item for item in rows if item["owner_id"] == row["owner_id"] and item["id"] == row["id"]), None)
+                if existing:
+                    existing.update(row)
+                else:
+                    self.sequence += 1
+                    rows.append({**row, "seq": self.sequence, "created_at": row.get("created_at") or "2026-10-20T12:00:00+00:00"})
+            self.posts.append((table, len(batch)))
             return b""
         if method == "DELETE":
             target = query["id"].removeprefix("eq.")

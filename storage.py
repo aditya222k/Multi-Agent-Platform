@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import queue
 import sqlite3
 import threading
 import time
@@ -15,6 +14,7 @@ import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 from urllib.parse import quote, urlencode, urlsplit
 
 from core import UserError, _NoRedirect, _error_message, _tls_context
@@ -27,6 +27,26 @@ RECENT_RUNS = 30
 UPSERT = {"Prefer": "resolution=merge-duplicates,return=minimal"}
 IMAGE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
 MESSAGE_COLUMNS = "id,sender,bot_id,text,image,files,created_at"
+# Outbox sync: send every SYNC_INTERVAL seconds, or at once when BATCH_SIZE changes are waiting.
+SYNC_INTERVAL = 10
+BATCH_SIZE = 100
+MAX_BACKOFF = 60
+
+
+def retryable(status: int) -> bool:
+    """Errors worth retrying later: no connection, timeouts, rate limits, expired sign-in, server trouble."""
+    return status in {0, 401, 408, 429} or status >= 500
+
+
+def _open_database(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not path.exists():
+        # Owner-only from the start; SQLite gives its WAL files the same permissions.
+        os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+    connection = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+    connection.execute("pragma journal_mode=wal")
+    connection.execute("pragma busy_timeout=5000")
+    return connection
 
 
 def load_config(root: Path) -> dict | None:
@@ -154,14 +174,8 @@ class SQLiteStore:
     def __init__(self, path: Path, images_dir: Path):
         self.path = path
         self.images_dir = images_dir
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if not path.exists():
-            # Owner-only from the start; SQLite gives its WAL files the same permissions.
-            os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
         self._lock = threading.Lock()
-        self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
-        self._db.execute("pragma journal_mode=wal")
-        self._db.execute("pragma busy_timeout=5000")
+        self._db = _open_database(path)
         self._db.executescript(self.SCHEMA)
 
     def _write(self, statements: list[tuple[str, tuple]]) -> None:
@@ -285,22 +299,146 @@ class SQLiteStore:
             self._db.close()
 
 
+class Outbox:
+    """Changes waiting to reach Supabase, kept on disk so an outage, crash, or restart loses none of them."""
+
+    SCHEMA = """
+        create table if not exists outbox (
+            seq integer primary key autoincrement,
+            owner_id text not null,
+            kind text not null,
+            target text not null,
+            row_key text not null,
+            payload blob not null,
+            content_type text not null default '',
+            sending integer not null default 0,
+            failed integer not null default 0,
+            error text not null default ''
+        );
+        create index if not exists outbox_pending on outbox (owner_id, failed, seq);
+    """
+
+    def __init__(self, path: Path, owner_id: str):
+        self.owner_id = owner_id
+        self._lock = threading.Lock()
+        self._db = _open_database(path)
+        self._db.executescript(self.SCHEMA)
+        # Anything still marked as sending when the app stopped never finished, so it goes again.
+        self._db.execute("update outbox set sending = 0 where owner_id = ?", (owner_id,))
+
+    def add(self, kind: str, target: str, key: str, payload: bytes, content_type: str = "", merge: bool = False) -> None:
+        """Append a change. With merge, a newer version of a still-waiting row replaces the older one."""
+        with self._lock:
+            self._db.execute("begin immediate")
+            try:
+                if merge:
+                    latest = self._db.execute(
+                        "select seq, kind, sending, failed from outbox where owner_id = ? and target = ? and row_key = ? order by seq desc limit 1",
+                        (self.owner_id, target, key)).fetchone()
+                    # Only the newest entry for a row may absorb the change, so a delete in between keeps its place.
+                    if latest and latest[1] == kind and not latest[2] and not latest[3]:
+                        self._db.execute("update outbox set payload = ? where seq = ?", (payload, latest[0]))
+                        self._db.execute("commit")
+                        return
+                self._db.execute("insert into outbox (owner_id, kind, target, row_key, payload, content_type) values (?, ?, ?, ?, ?, ?)",
+                                 (self.owner_id, kind, target, key, payload, content_type))
+                self._db.execute("commit")
+            except BaseException:
+                self._db.execute("rollback")
+                raise
+
+    def take(self, limit: int) -> list[dict]:
+        """The oldest waiting changes, marked as sending so later edits to them become new entries."""
+        with self._lock:
+            rows = self._db.execute(
+                "select seq, kind, target, row_key, payload, content_type from outbox where owner_id = ? and failed = 0 and sending = 0 order by seq limit ?",
+                (self.owner_id, limit)).fetchall()
+            if rows:
+                self._db.execute(f"update outbox set sending = 1 where seq in ({','.join('?' * len(rows))})", tuple(row[0] for row in rows))
+        return [dict(zip(("seq", "kind", "target", "key", "payload", "content_type"), row)) for row in rows]
+
+    def finish(self, seqs: list[int]) -> None:
+        if seqs:
+            with self._lock:
+                self._db.execute(f"delete from outbox where seq in ({','.join('?' * len(seqs))})", tuple(seqs))
+
+    def release(self, seqs: list[int]) -> None:
+        if seqs:
+            with self._lock:
+                self._db.execute(f"update outbox set sending = 0 where seq in ({','.join('?' * len(seqs))})", tuple(seqs))
+
+    def park(self, seq: int, error: str) -> None:
+        """Set aside a change Supabase rejected, so it stops blocking the ones behind it."""
+        with self._lock:
+            self._db.execute("update outbox set sending = 0, failed = 1, error = ? where seq = ?", (error[:500], seq))
+
+    def counts(self) -> tuple[int, int, str]:
+        """Waiting changes, rejected changes, and the first rejection's reason."""
+        with self._lock:
+            waiting, failed = self._db.execute(
+                "select coalesce(sum(failed = 0), 0), coalesce(sum(failed = 1), 0) from outbox where owner_id = ?", (self.owner_id,)).fetchone()
+            first = self._db.execute("select error from outbox where owner_id = ? and failed = 1 order by seq limit 1", (self.owner_id,)).fetchone()
+        return waiting, failed, first[0] if first else ""
+
+    def image(self, target: str) -> bytes | None:
+        with self._lock:
+            row = self._db.execute("select payload from outbox where owner_id = ? and kind = 'image' and target = ? order by seq desc limit 1",
+                                   (self.owner_id, target)).fetchone()
+        return bytes(row[0]) if row else None
+
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
+
+
+class _Unreachable(Exception):
+    """Supabase did not respond usefully; the changes stay in the outbox for a later try."""
+
+
 class SupabaseStore:
-    """One signed-in account. Reads happen at sign-in; writes go through one ordered background queue."""
+    """One signed-in account. Reads happen at sign-in; writes go through a saved outbox, sent in batches."""
 
     kind = "supabase"
 
-    def __init__(self, config: dict, session: dict, grants_file: Path):
+    def __init__(self, config: dict, session: dict, grants_file: Path, outbox_file: Path | None = None,
+                 on_status: Callable[[dict], None] | None = None):
         self.config = config
         self.session = session
         self.grants_file = grants_file
-        self.error = ""
+        self.notice = ""
+        self.on_status = on_status or (lambda status: None)
         self._session_lock = threading.Lock()
-        self._writes: queue.Queue = queue.Queue()
-        # Images stay in memory until their upload finishes, so the chat can show them at once.
+        self.outbox = Outbox(outbox_file or grants_file.with_name("outbox.db"), session["user_id"])
+        # Images stay in memory briefly, so the chat can show them before the upload finishes.
         self._recent: OrderedDict[str, bytes] = OrderedDict()
         self._recent_lock = threading.Lock()
-        threading.Thread(target=self._drain, daemon=True).start()
+        self._wake = threading.Event()
+        self._stopped = False
+        self._offline = ""
+        self._backoff = 0.0
+        self._attempts = 0
+        self._last_status: dict | None = None
+        self._worker = threading.Thread(target=self._sync_loop, daemon=True)
+        self._worker.start()
+
+    @property
+    def error(self) -> str:
+        """A problem the person should know about: rejected changes, or a schema that needs updating."""
+        _, failed, reason = self.outbox.counts()
+        if failed:
+            return f"{failed} change{'s' if failed != 1 else ''} could not be saved to Supabase: {reason}"
+        return self.notice
+
+    def sync_status(self) -> dict:
+        waiting, failed, _ = self.outbox.counts()
+        state = "saved" if not waiting else "offline" if self._offline else "saving"
+        return {"state": state, "pending": waiting, "failed": failed, "reason": self._offline if waiting else ""}
+
+    def _report(self) -> None:
+        status = self.sync_status()
+        if status != self._last_status:
+            self._last_status = status
+            self.on_status(status)
 
     @property
     def user_id(self) -> str:
@@ -369,7 +507,7 @@ class SupabaseStore:
         try:
             rows = json.loads(self._request("GET", "/rest/v1/message_counts", params={"select": "group_id,message_count"}))
         except SupabaseError as error:
-            self.error = f"Message totals are unavailable: run supabase/schema.sql again in the Supabase SQL editor. ({error})"
+            self.notice = f"Message totals are unavailable: run supabase/schema.sql again in the Supabase SQL editor. ({error})"
             return {}
         return {row["group_id"]: int(row["message_count"]) for row in rows if isinstance(row, dict) and "group_id" in row}
 
@@ -389,7 +527,7 @@ class SupabaseStore:
             raw = self._request("GET", "/rest/v1/runs", params={"select": "data", "order": "updated_at.desc", "limit": RECENT_RUNS, "offset": 0})
         except SupabaseError as error:
             # Accounts created before run history existed can still sign in.
-            self.error = f"Run history is not saved yet: run supabase/schema.sql again in the Supabase SQL editor. ({error})"
+            self.notice = f"Run history is not saved yet: run supabase/schema.sql again in the Supabase SQL editor. ({error})"
             return []
         runs = [row["data"] for row in json.loads(raw) if isinstance(row, dict) and isinstance(row.get("data"), dict)]
         return sorted(runs, key=lambda run: run.get("created_at") or 0)
@@ -401,38 +539,41 @@ class SupabaseStore:
             return []
         return grants if isinstance(grants, list) else []
 
-    def _queue(self, method: str, path: str, **options: object) -> None:
-        self._writes.put((method, path, options))
+    def _upsert(self, table: str, row: dict) -> None:
+        self.outbox.add("upsert", table, row["id"], json.dumps(row, ensure_ascii=False).encode("utf-8"), merge=True)
+        self._changed()
+
+    def _changed(self) -> None:
+        self._report()
+        if self.outbox.counts()[0] >= BATCH_SIZE:
+            self._wake.set()
 
     def put_bot(self, bot: dict) -> None:
-        row = {"owner_id": self.user_id, "id": bot["id"], "data": {key: value for key, value in bot.items() if key != "id"}}
-        self._queue("POST", "/rest/v1/bots", params={"on_conflict": "owner_id,id"}, body=row, headers=UPSERT)
+        self._upsert("bots", {"owner_id": self.user_id, "id": bot["id"], "data": {key: value for key, value in bot.items() if key != "id"}})
 
     def delete_bot(self, bot_id: str) -> None:
-        self._queue("DELETE", "/rest/v1/bots", params={"id": f"eq.{bot_id}"})
+        self.outbox.add("delete", "bots", bot_id, b"")
+        self._changed()
 
     def put_group(self, group: dict) -> None:
-        row = {"owner_id": self.user_id, "id": group["id"], "name": group["name"], "mode": group.get("mode", "conversation"),
-               "master_id": group.get("master_id", ""), "quality_criteria": group.get("quality_criteria", ""),
-               "bot_ids": group["bot_ids"], "last_workflow": group.get("last_workflow")}
-        self._queue("POST", "/rest/v1/groups", params={"on_conflict": "owner_id,id"}, body=row, headers=UPSERT)
+        self._upsert("groups", {"owner_id": self.user_id, "id": group["id"], "name": group["name"], "mode": group.get("mode", "conversation"),
+                                "master_id": group.get("master_id", ""), "quality_criteria": group.get("quality_criteria", ""),
+                                "bot_ids": group["bot_ids"], "last_workflow": group.get("last_workflow")})
 
     def delete_group(self, group_id: str) -> None:
-        self._queue("DELETE", "/rest/v1/groups", params={"id": f"eq.{group_id}"})
+        self.outbox.add("delete", "groups", group_id, b"")
+        self._changed()
 
     def add_message(self, group_id: str, message: dict) -> None:
-        row = {"owner_id": self.user_id, "group_id": group_id, "id": message["id"], "sender": message["sender"],
-               "bot_id": message.get("bot_id", ""), "text": message["text"], "files": message.get("files", [])}
-        if message.get("image"):
-            row["image"] = message["image"]
-        if message.get("created_at"):
-            row["created_at"] = message["created_at"]
-        self._queue("POST", "/rest/v1/messages", params={"on_conflict": "owner_id,id"}, body=row, headers=UPSERT)
+        # Every row carries the same columns, so a batch can go in one request.
+        self._upsert("messages", {"owner_id": self.user_id, "group_id": group_id, "id": message["id"], "sender": message["sender"],
+                                  "bot_id": message.get("bot_id", ""), "text": message["text"], "files": message.get("files", []),
+                                  "image": message.get("image") or None,
+                                  "created_at": message.get("created_at") or datetime.now(timezone.utc).isoformat()})
 
     def put_run(self, run: dict) -> None:
-        row = {"owner_id": self.user_id, "id": run["id"], "group_id": run["group_id"], "data": run,
-               "updated_at": datetime.now(timezone.utc).isoformat()}
-        self._queue("POST", "/rest/v1/runs", params={"on_conflict": "owner_id,id"}, body=row, headers=UPSERT)
+        self._upsert("runs", {"owner_id": self.user_id, "id": run["id"], "group_id": run["group_id"], "data": run,
+                              "updated_at": datetime.now(timezone.utc).isoformat()})
 
     def put_grants(self, grants: list[str]) -> None:
         # Grants are paths on this computer, so they stay local even when signed in.
@@ -450,8 +591,8 @@ class SupabaseStore:
             self._recent[name] = data
             while len(self._recent) > RECENT_IMAGES:
                 self._recent.popitem(last=False)
-        self._queue("POST", self._image_path(name), data=data,
-                    headers={"Content-Type": IMAGE_TYPES[name.rsplit(".", 1)[1]], "x-upsert": "true"})
+        self.outbox.add("image", self._image_path(name), name, data, IMAGE_TYPES[name.rsplit(".", 1)[1]])
+        self._changed()
 
     def save_image(self, data: bytes, kind: str) -> str:
         name = f"{uuid.uuid4().hex}.{kind}"
@@ -462,38 +603,110 @@ class SupabaseStore:
         with self._recent_lock:
             if name in self._recent:
                 return self._recent[name]
+        # An image still waiting to upload is shown from the outbox, even while offline.
+        waiting = self.outbox.image(self._image_path(name))
+        if waiting is not None:
+            return waiting
         try:
             return self._request("GET", self._image_path(name).replace("/object/", "/object/authenticated/", 1))
         except SupabaseError as error:
             raise OSError(str(error)) from None
 
-    def _drain(self) -> None:
-        while True:
-            item = self._writes.get()
+    def _sync_loop(self) -> None:
+        while not self._stopped:
+            self._wake.wait(self._backoff or SYNC_INTERVAL)
+            self._wake.clear()
+            if self._stopped:
+                return
             try:
-                if item is None:
-                    return
-                method, path, options = item
-                for attempt in range(4):
-                    try:
-                        self._request(method, path, **options)
-                        self.error = ""
-                        break
-                    except SupabaseError as error:
-                        retryable = error.status in {0, 401, 408, 429} or error.status >= 500
-                        if not retryable or attempt == 3:
-                            self.error = f"Could not save a change to Supabase: {error}"
-                            break
-                        time.sleep(2 ** attempt)
+                self._send_waiting()
+                self._offline, self._backoff = "", 0.0
+            except Exception as error:
+                if self._stopped:
+                    return  # The outbox closed while a send was finishing.
+                # Keep everything and try again later, waiting longer each time up to a minute.
+                self._offline = str(error) if isinstance(error, _Unreachable) else f"Sync paused: {error}"
+                self._backoff = min(MAX_BACKOFF, max(2.0, self._backoff * 2))
+            self._attempts += 1
+            self._report()
+
+    @staticmethod
+    def _batches(entries: list[dict]) -> list[list[dict]]:
+        """Consecutive upserts to one table travel together; deletes and images go one at a time."""
+        batches: list[list[dict]] = []
+        for entry in entries:
+            previous = batches[-1][-1] if batches else None
+            if previous and entry["kind"] == "upsert" and previous["kind"] == "upsert" and previous["target"] == entry["target"]:
+                batches[-1].append(entry)
+            else:
+                batches.append([entry])
+        return batches
+
+    def _send_waiting(self) -> None:
+        while not self._stopped:
+            entries = self.outbox.take(BATCH_SIZE)
+            if not entries:
+                return
+            unsent = [entry["seq"] for entry in entries]
+            try:
+                for batch in self._batches(entries):
+                    self._send(batch)
+                    unsent = unsent[len(batch):]
             finally:
-                self._writes.task_done()
+                self.outbox.release(unsent)
+            self._report()
+
+    def _send(self, batch: list[dict]) -> None:
+        try:
+            self._deliver(batch)
+            self.outbox.finish([entry["seq"] for entry in batch])
+            return
+        except SupabaseError as error:
+            if retryable(error.status):
+                raise _Unreachable(str(error)) from None
+            if len(batch) == 1:
+                self.outbox.park(batch[0]["seq"], str(error))
+                return
+        # Supabase refused the batch: send each change alone to find the one it rejects.
+        for entry in batch:
+            self._send([entry])
+
+    def _deliver(self, batch: list[dict]) -> None:
+        try:
+            self._access_token()
+        except SupabaseError as error:
+            raise _Unreachable(f"Sign-in could not be refreshed: {error}") from None
+        first = batch[0]
+        if first["kind"] == "upsert":
+            rows = {}
+            for entry in batch:
+                row = json.loads(entry["payload"])
+                rows[row["id"]] = row
+            self._request("POST", f"/rest/v1/{first['target']}", params={"on_conflict": "owner_id,id"}, body=list(rows.values()), headers=UPSERT)
+        elif first["kind"] == "delete":
+            self._request("DELETE", f"/rest/v1/{first['target']}", params={"id": f"eq.{first['key']}"})
+        else:
+            self._request("POST", first["target"], data=bytes(first["payload"]), headers={"Content-Type": first["content_type"], "x-upsert": "true"})
 
     def flush(self, timeout: float = 15) -> bool:
+        """Try to send everything now. False means some changes are still waiting in the outbox."""
+        attempts = self._attempts
+        self._wake.set()
         deadline = time.monotonic() + timeout
-        while self._writes.unfinished_tasks and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            if not self.outbox.counts()[0]:
+                return True
+            if self._attempts > attempts and self._offline:
+                return False  # Supabase is not answering; the worker keeps retrying on its own schedule.
             time.sleep(0.05)
-        return not self._writes.unfinished_tasks
+        return not self.outbox.counts()[0]
 
-    def close(self) -> None:
-        self.flush()
-        self._writes.put(None)
+    def close(self, timeout: float = 15) -> int:
+        """Send what can be sent, then stop. Returns how many changes stay saved for next time."""
+        self.flush(timeout)
+        waiting = self.outbox.counts()[0]
+        self._stopped = True
+        self._wake.set()
+        self._worker.join(5)
+        self.outbox.close()
+        return waiting
