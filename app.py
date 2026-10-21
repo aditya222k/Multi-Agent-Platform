@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from collections import deque
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,44 @@ GRANTS_FILE = ROOT / ".local" / "grants.json"
 IMAGES_DIR = ROOT / ".local" / "images"
 IMAGE_NAME = re.compile(r"^[0-9a-f]{32}\.(png|jpg|gif|webp)$")
 MAX_REQUEST_BYTES = 100 * 1024
+
+
+class EventHub:
+    """Recent changes, numbered, for browsers listening on /api/events."""
+
+    def __init__(self, keep: int = 500) -> None:
+        self.condition = threading.Condition()
+        self.events: deque[tuple[int, str, str]] = deque(maxlen=keep)
+        self.next_id = 1
+        self.closed = False
+
+    def publish(self, kind: str, data: dict) -> None:
+        # Serialised now, so later changes to the same objects cannot alter a sent event.
+        payload = json.dumps(data, ensure_ascii=False)
+        with self.condition:
+            self.events.append((self.next_id, kind, payload))
+            self.next_id += 1
+            self.condition.notify_all()
+
+    def latest(self) -> int:
+        with self.condition:
+            return self.next_id - 1
+
+    def since(self, last_id: int) -> list[tuple[int, str, str]] | None:
+        """Events after last_id, or None when some of them were already dropped."""
+        with self.condition:
+            if self.events and last_id < self.events[0][0] - 1:
+                return None
+            return [event for event in self.events if event[0] > last_id]
+
+    def wait(self, last_id: int, timeout: float) -> None:
+        with self.condition:
+            self.condition.wait_for(lambda: self.closed or self.next_id - 1 > last_id, timeout)
+
+    def close(self) -> None:
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
 
 
 def now() -> str:
@@ -132,6 +171,7 @@ class State(Workspace):
         self.keys: dict[str, str] = {}
         self.runs: dict[str, dict] = {}
         self.stop_events: dict[str, threading.Event] = {}
+        self.events = EventHub()
         self.store: LocalStore | SupabaseStore | None = LocalStore(self.save, IMAGES_DIR)
         # Set when Supabase is configured; the account is then required before any data loads.
         self.supabase: dict | None = None
@@ -162,13 +202,40 @@ class State(Workspace):
         with self.lock:
             return copy.deepcopy({
                 "bots": self.bots,
-                "groups": self.groups,
+                "groups": [{**{key: value for key, value in group.items() if key != "messages"}, "message_count": len(group["messages"])} for group in self.groups],
                 "grants": self.grants,
                 "key_status": {bot["id"]: bool(self.keys.get(bot["id"])) for bot in self.bots},
                 "runs": list(self.runs.values())[-30:][::-1],
                 "account": {"mode": "supabase" if self.supabase else "local", "email": getattr(self.store, "email", "")},
                 "sync_error": getattr(self.store, "error", ""),
             })
+
+    def publish_run(self, run_id: str) -> None:
+        with self.lock:
+            run = self.runs.get(run_id)
+            if run is not None:
+                self.events.publish("run", {"run": run, "sync_error": getattr(self.store, "error", "")})
+
+    def publish_message(self, group_id: str, message: dict) -> None:
+        with self.lock:
+            count = len(self.group(group_id)["messages"])
+            self.events.publish("message", {"group_id": group_id, "message": message, "message_count": count})
+
+    def messages_page(self, group_id: str, after: str, before: str, limit: int) -> dict:
+        """The latest messages, those after a known message, or an older page before one."""
+        with self.lock:
+            messages = self.group(group_id)["messages"]
+            ids = [message["id"] for message in messages]
+            reset = False
+            if after and after in ids:
+                window, has_more = messages[ids.index(after) + 1:], False
+            else:
+                # An unknown "after" means the browser's copy is stale, so it gets a fresh window.
+                reset = bool(after)
+                end = ids.index(before) if before in ids else len(messages)
+                start = max(0, end - limit)
+                window, has_more = messages[start:end], start > 0
+            return copy.deepcopy({"messages": window, "has_more": has_more, "total": len(messages), "reset": reset})
 
     def _clear(self) -> None:
         for event in self.stop_events.values():
@@ -230,6 +297,8 @@ class State(Workspace):
         with self.lock:
             store, self.store = self.store, None
             self._clear()
+        # Wakes open event streams so they notice the sign-out and close.
+        self.events.publish("session", {})
         if isinstance(store, SupabaseStore):
             store.close()
             SupabaseAuth(self.supabase).sign_out(store.session)
@@ -386,6 +455,9 @@ class Handler(BaseHTTPRequestHandler):
             # Image files never change, so the browser can keep them between polls.
             self._send(HTTPStatus.OK, data, IMAGE_TYPES[name.rsplit(".", 1)[1]], "private, max-age=31536000, immutable")
             return
+        if path.path == "/api/events":
+            self._event_stream(parse_qs(path.query).get("token", [""])[0])
+            return
         if path.path in {"/static/app.js", "/static/style.css"}:
             file = ROOT / path.path.lstrip("/")
             content_type = "text/javascript; charset=utf-8" if file.suffix == ".js" else "text/css; charset=utf-8"
@@ -400,6 +472,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.path == "/api/state":
             self._json(HTTPStatus.OK, STATE.public())
+        elif path.path.startswith("/api/groups/") and path.path.endswith("/messages") and path.path.count("/") == 4:
+            query = parse_qs(path.query)
+            try:
+                limit = max(1, min(500, int(query.get("limit", ["200"])[0])))
+                page = STATE.messages_page(path.path.split("/")[3], query.get("after", [""])[0], query.get("before", [""])[0], limit)
+            except UserError as error:
+                self._json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+                return
+            except ValueError:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid message range."})
+                return
+            self._json(HTTPStatus.OK, page)
         elif path.path.startswith("/api/runs/"):
             run_id = path.path.rsplit("/", 1)[-1]
             with STATE.lock:
@@ -407,6 +491,38 @@ class Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK if run else HTTPStatus.NOT_FOUND, run or {"error": "Run not found."})
         else:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+
+    def _event_stream(self, token: str) -> None:
+        # EventSource cannot send headers, so the stream takes the token as a query like images do.
+        if not secrets.compare_digest(token, STATE.token):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "Use the URL printed by the server."})
+            return
+        if not self._require_account():
+            return
+        hub = STATE.events
+        last = hub.latest()
+        self.close_connection = True
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            self.wfile.write(b"retry: 2000\n\n")
+            while not hub.closed and STATE.signed_in():
+                events = hub.since(last)
+                if events is None:
+                    # This browser fell too far behind to catch up from events, so it reloads instead.
+                    events = [(hub.latest(), "resync", "{}")]
+                for event_id, kind, data in events:
+                    self.wfile.write(f"id: {event_id}\nevent: {kind}\ndata: {data}\n\n".encode("utf-8"))
+                    last = event_id
+                if not events:
+                    self.wfile.write(b": keep-alive\n\n")
+                self.wfile.flush()
+                hub.wait(last, 15)
+        except OSError:
+            pass  # The browser closed the page or is reconnecting.
 
     def do_POST(self) -> None:
         if not self._check_api():
@@ -471,6 +587,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, STATE.public())
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+                return
+            if parts[-1] not in {"send", "stop"}:
+                STATE.events.publish("state", {})
         except UserError as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
         except subprocess.TimeoutExpired:
@@ -523,6 +642,7 @@ class Handler(BaseHTTPRequestHandler):
                         if run.get("workflow"):
                             run["workflow"]["phase"] = "stopped"
                             STATE.group(group_id)["last_workflow"] = copy.deepcopy(run["workflow"])
+                        STATE.publish_run(run["id"])
                 STATE.require_store().put_group(STATE.group(group_id))
             self._json(HTTPStatus.OK, STATE.public())
             return
@@ -612,6 +732,8 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 STATE.runs.pop(finished)
             store.add_message(group_id, user_message)
+            STATE.publish_message(group_id, user_message)
+            STATE.publish_run(run_id)
         threading.Thread(target=execute_group_run, args=(run_id, group_id, group_title, bots, history, files, keys), daemon=True).start()
         self._json(HTTPStatus.ACCEPTED, {"run_id": run_id})
 
@@ -630,11 +752,13 @@ def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[d
             if run_id in STATE.runs and STATE.runs[run_id]["status"] == "running":
                 STATE.runs[run_id]["current_bot"] = bot["name"]
                 STATE.runs[run_id]["waiting_reason"] = ""
+                STATE.publish_run(run_id)
 
     def on_wait(message: str) -> None:
         with STATE.lock:
             if run_id in STATE.runs and STATE.runs[run_id]["status"] == "running":
                 STATE.runs[run_id]["waiting_reason"] = message
+                STATE.publish_run(run_id)
 
     def on_progress(progress: dict) -> None:
         with STATE.lock:
@@ -645,6 +769,7 @@ def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[d
                 group = STATE.group(group_id)
                 group["last_workflow"] = copy.deepcopy(progress)
                 STATE.require_store().put_group(group)
+                STATE.publish_run(run_id)
 
     def accepting() -> bool:
         run = STATE.runs.get(run_id)
@@ -665,6 +790,8 @@ def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[d
             STATE.group(group_id)["messages"].append(complete)
             STATE.runs[run_id]["completed"] += 1
             STATE.require_store().add_message(group_id, complete)
+            STATE.publish_message(group_id, complete)
+            STATE.publish_run(run_id)
 
     try:
         if mode == "workflow":
@@ -699,6 +826,7 @@ def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[d
     finally:
         with STATE.lock:
             STATE.stop_events.pop(run_id, None)
+            STATE.publish_run(run_id)
 
 
 def main() -> None:
@@ -725,6 +853,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        STATE.events.close()
         server.server_close()
         # Send any Supabase changes still waiting in the write queue.
         STATE.close()

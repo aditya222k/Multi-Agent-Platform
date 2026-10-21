@@ -5,7 +5,9 @@ let selectedBotId = null;
 let selectedGroupId = new URLSearchParams(location.search).get('group');
 let selectedFiles = new Set();
 let drafts = new Map();
-let pollTimer = null;
+let events = null;
+// Messages per group, loaded when a chat opens and then kept current by pushed events.
+const conversations = new Map();
 let workflowViewKey = '';
 
 async function api(path, body) {
@@ -24,7 +26,8 @@ async function api(path, body) {
 
 // With Supabase configured, the app waits behind this sign-in screen.
 function showLogin() {
-  clearTimeout(pollTimer);
+  stopEvents();
+  conversations.clear();
   for (const id of ['bots-page', 'chats-page', 'account', 'import-card']) $(id).hidden = true;
   document.querySelector('.main-nav').hidden = true;
   $('login-page').hidden = false;
@@ -213,7 +216,7 @@ function renderGroupList() {
     const avatar = node('span', 'rail-avatar', group.name.slice(0, 1).toUpperCase());
     const copy = node('span', 'rail-copy');
     const botCount = group.bot_ids.length;
-    const messageCount = group.messages.length;
+    const messageCount = group.message_count;
     copy.append(node('strong', null, group.name), node('small', null, `${botCount} bot${botCount === 1 ? '' : 's'} · ${messageCount} message${messageCount === 1 ? '' : 's'}`));
     button.append(avatar, copy);
     button.addEventListener('click', () => selectGroup(group.id));
@@ -272,7 +275,7 @@ function renderWorkflowProgress(group, run) {
 function updateGroupSummary() {
   const group = findGroup(selectedGroupId);
   if (!group) return;
-  $('group-summary').textContent = `${group.bot_ids.length} bot${group.bot_ids.length === 1 ? '' : 's'} in this room · ${group.messages.length} message${group.messages.length === 1 ? '' : 's'}`;
+  $('group-summary').textContent = `${group.bot_ids.length} bot${group.bot_ids.length === 1 ? '' : 's'} in this room · ${group.message_count} message${group.message_count === 1 ? '' : 's'}`;
   $('member-count').textContent = String(group.bot_ids.length);
   const run = latestRun(group.id);
   const status = $('run-status');
@@ -348,8 +351,20 @@ function renderMessages() {
   const nearBottom = host.scrollHeight - host.scrollTop - host.clientHeight < 90;
   host.replaceChildren();
   if (!group) return;
-  if (!group.messages.length) host.append(node('div', 'conversation-empty', 'This group is ready. Send a message to begin.'));
-  for (const message of group.messages) {
+  const chat = conversations.get(group.id);
+  if (!chat) {
+    host.append(node('div', 'conversation-empty', 'Loading messages…'));
+    loadMessages(group.id).then(() => { if (selectedGroupId === group.id) renderMessages(); }, (error) => notice(error.message, true));
+    return;
+  }
+  if (chat.hasMore) {
+    const earlier = node('button', 'link-button load-earlier', 'Show earlier messages');
+    earlier.type = 'button';
+    earlier.addEventListener('click', () => loadEarlier(group.id));
+    host.append(earlier);
+  }
+  if (!chat.messages.length) host.append(node('div', 'conversation-empty', 'This group is ready. Send a message to begin.'));
+  for (const message of chat.messages) {
     const isUser = !message.bot_id;
     const item = node('article', `message${isUser ? ' user' : ` ${voice(message.bot_id)}`}`);
     item.append(node('div', 'message-avatar', isUser ? 'Y' : message.sender.slice(0, 1).toUpperCase()));
@@ -377,7 +392,7 @@ function renderMessages() {
     const speaker = state.bots.find((bot) => bot.name === run.current_bot);
     host.append(node('div', `waiting${speaker ? ` ${voice(speaker.id)}` : ''}`, run.waiting_reason || (run.current_bot ? `${run.current_bot} is replying…` : 'Starting the conversation…')));
   }
-  if (nearBottom || group.messages.length < 3) host.scrollTop = host.scrollHeight;
+  if (nearBottom || chat.messages.length < 3) host.scrollTop = host.scrollHeight;
 }
 
 function renderChat(full = false) {
@@ -420,26 +435,108 @@ function updateAttachedCount() {
   $('attached-count').textContent = count ? `${count} Desktop file${count === 1 ? '' : 's'} attached to this message` : 'No Desktop files attached';
 }
 
-async function pollRuns() {
-  clearTimeout(pollTimer);
+async function loadMessages(groupId) {
+  const page = await api(`/api/groups/${groupId}/messages`);
+  conversations.set(groupId, { messages: page.messages, hasMore: page.has_more });
+}
+
+async function loadEarlier(groupId) {
+  const chat = conversations.get(groupId);
+  if (!chat?.messages.length) return;
+  const host = $('messages');
+  const fromBottom = host.scrollHeight - host.scrollTop;
   try {
-    const previouslyRunning = new Set(state.runs.filter((run) => run.status === 'running').map((run) => run.id));
-    state = await api('/api/state');
-    renderGroupList(); renderBotGroups(); renderChat(false);
-    const failed = state.runs.find((run) => previouslyRunning.has(run.id) && run.status === 'failed');
-    if (failed) notice(failed.error, true);
-    else showSyncError();
-    if (state.runs.some((run) => run.status === 'running')) pollTimer = setTimeout(pollRuns, 1200);
+    const page = await api(`/api/groups/${groupId}/messages?${new URLSearchParams({ before: chat.messages[0].id })}`);
+    chat.messages = [...page.messages, ...chat.messages];
+    chat.hasMore = page.has_more;
+    renderMessages();
+    host.scrollTop = host.scrollHeight - fromBottom;
   } catch (error) { notice(error.message, true); }
 }
 
+// Fetches only messages newer than the last one this page has.
+async function loadNewMessages(groupId) {
+  const chat = conversations.get(groupId);
+  if (!chat) return;
+  const last = chat.messages.at(-1);
+  if (!last) { await loadMessages(groupId); return; }
+  const page = await api(`/api/groups/${groupId}/messages?${new URLSearchParams({ after: last.id })}`);
+  if (page.reset) conversations.set(groupId, { messages: page.messages, hasMore: page.has_more });
+  else for (const message of page.messages) addMessage(groupId, message);
+}
+
+function addMessage(groupId, message) {
+  const chat = conversations.get(groupId);
+  if (chat && !chat.messages.some((item) => item.id === message.id)) chat.messages.push(message);
+}
+
+async function refreshState() {
+  state = await api('/api/state');
+  renderGroupList(); renderBotGroups(); renderChat(false);
+  showSyncError();
+}
+
+// Reloads everything this page shows, after connecting or reconnecting to the event stream.
+async function resync() {
+  try {
+    await refreshState();
+    await Promise.all([...conversations.keys()].filter((id) => findGroup(id)).map(loadNewMessages));
+    renderChat(false);
+  } catch (error) { notice(error.message, true); }
+}
+
+function applyRun({ run, sync_error: syncError }) {
+  const index = state.runs.findIndex((item) => item.id === run.id);
+  const previous = index >= 0 ? state.runs[index] : null;
+  if (index >= 0) state.runs[index] = run; else state.runs.unshift(run);
+  if (previous?.status === 'running' && ['failed', 'blocked'].includes(run.status)) notice(run.error, true);
+  else if (syncError) notice(syncError, true);
+  renderGroupList();
+  if (run.group_id === selectedGroupId && page() === 'chats') { updateGroupSummary(); renderMessages(); renderGroupMembers(); }
+}
+
+function applyMessage({ group_id: groupId, message, message_count: count }) {
+  const group = findGroup(groupId);
+  if (group) group.message_count = count;
+  addMessage(groupId, message);
+  renderGroupList();
+  if (groupId === selectedGroupId && page() === 'chats') { updateGroupSummary(); renderMessages(); }
+}
+
+function listen() {
+  stopEvents();
+  const source = new EventSource(`/api/events?${new URLSearchParams({ token })}`);
+  events = source;
+  const handle = (apply) => (event) => { try { apply(JSON.parse(event.data)); } catch (error) { notice(error.message, true); } };
+  source.addEventListener('open', resync);
+  source.addEventListener('message', handle(applyMessage));
+  source.addEventListener('run', handle(applyRun));
+  source.addEventListener('state', () => refreshState().catch((error) => notice(error.message, true)));
+  source.addEventListener('resync', resync);
+  source.addEventListener('error', async () => {
+    // The browser retries dropped connections itself; a refused stream usually means the session ended.
+    if (source.readyState !== EventSource.CLOSED || events !== source) return;
+    try {
+      const session = await api('/api/session');
+      if (!session.signed_in) showLogin();
+      else setTimeout(() => { if (events === source) listen(); }, 2000);
+    } catch { setTimeout(() => { if (events === source) listen(); }, 2000); }
+  });
+}
+
+function stopEvents() {
+  if (events) events.close();
+  events = null;
+}
+
 async function startApp() {
+  conversations.clear();
   state = await api('/api/state');
   selectedBotId = state.bots[0]?.id || null;
   if (!findGroup(selectedGroupId)) selectedGroupId = state.groups[0]?.id || null;
   navigate(page(), selectedGroupId, false);
   showSyncError();
-  if (state.runs.some((run) => run.status === 'running')) pollRuns();
+  listen();
 }
 
 async function initialize() {
@@ -574,9 +671,8 @@ $('send-message').addEventListener('click', async () => {
     await api(`/api/groups/${group.id}/send`, { text, files: [...selectedFiles], mode: settings.mode, continuous: settings.mode !== 'workflow' });
     $('chat-input').value = '';
     selectedFiles.clear();
-    state = await api('/api/state');
-    renderGrants(); renderGroupList(); renderChat(false);
-    pollRuns();
+    // The new message and the run's progress arrive as pushed events.
+    renderGrants(); updateAttachedCount();
   } catch (error) { $('send-message').disabled = false; $('run-error').textContent = error.message; $('run-error').hidden = false; notice(error.message, true); }
 });
 

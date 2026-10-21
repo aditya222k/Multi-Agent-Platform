@@ -170,6 +170,7 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
 .login-card input{padding:9px 11px;border:1px solid var(--line-strong);border-radius:8px;background:var(--surface)}
 .login-actions{display:flex;gap:10px;flex-wrap:wrap}
 .login-error{margin:0;padding:10px 14px;background:var(--danger-soft);border-left:3px solid var(--danger);border-radius:4px;color:var(--danger);font-size:13px}
+.load-earlier{align-self:center}
 .message-image{display:block;width:min(100%,420px);height:auto;border-radius:10px;margin:2px 0 10px;background:var(--line)}
 .message.user{align-self:flex-end;flex-direction:row-reverse}
 .message.user .message-avatar{background:var(--ink);color:var(--fog)}
