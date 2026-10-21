@@ -141,7 +141,7 @@ class RunHistoryTests(unittest.TestCase):
             self.assertEqual(list(restarted.runs), ["done", "live"])
             self.assertEqual(restarted.runs["done"]["status"], "complete")
             self.assertEqual((restarted.runs["live"]["status"], restarted.runs["live"]["current_bot"]), ("interrupted", ""))
-            saved = json.loads((Path(temp) / "settings.json").read_text())["runs"]
+            saved = app.State().store.load(app.HISTORY_WINDOW)["runs"]
             self.assertEqual([run["status"] for run in saved], ["complete", "interrupted"])
 
     def test_supabase_runs_round_trip_and_interrupted_runs_are_saved_back(self):
@@ -153,9 +153,9 @@ class RunHistoryTests(unittest.TestCase):
             store.put_run({"id": "r1", "group_id": "g1", "status": "complete", "created_at": 1.0})
             store.put_run({"id": "r2", "group_id": "g1", "status": "running", "created_at": 2.0})
             store.close()
-            self.assertEqual([run["id"] for run in storage.SupabaseStore(CONFIG, session(), grants).load()["runs"]], ["r1", "r2"])
+            self.assertEqual([run["id"] for run in storage.SupabaseStore(CONFIG, session(), grants).load(200)["runs"]], ["r1", "r2"])
             with patch.object(app, "GRANTS_FILE", grants):
-                state = app.State()
+                state = app.State(load=False)
                 state.use_supabase(CONFIG)
                 state.sign_in("me@example.com", "secret")
                 state.store.flush(2)
@@ -167,7 +167,7 @@ class RunHistoryTests(unittest.TestCase):
         fake = FakeSupabase()
         fake.missing.add("runs")
         with patch.object(storage, "_http", fake), tempfile.TemporaryDirectory() as temp, patch.object(app, "GRANTS_FILE", Path(temp) / "grants.json"):
-            state = app.State()
+            state = app.State(load=False)
             state.use_supabase(CONFIG)
             state.sign_in("me@example.com", "secret")
             self.assertEqual([group["name"] for group in state.groups], ["General"])

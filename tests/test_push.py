@@ -152,7 +152,7 @@ class PushAPITests(unittest.TestCase):
 
 class SignedOutStreamTests(unittest.TestCase):
     def test_stream_needs_a_signed_in_account_with_supabase(self):
-        state = app.State()
+        state = app.State(load=False)
         state.use_supabase({"url": "https://project.supabase.co", "key": "publishable"})
         with patch.object(app, "STATE", state):
             server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)

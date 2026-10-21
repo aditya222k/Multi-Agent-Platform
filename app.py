@@ -8,6 +8,7 @@ import json
 import queue
 import re
 import secrets
+import sqlite3
 import subprocess
 import threading
 import time
@@ -21,7 +22,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from core import UserError, blank_bot, read_allowed_files, run_group_conversation, validate_bot, validate_desktop_file, validate_runnable
-from storage import IMAGE_TYPES, LocalStore, SupabaseAuth, SupabaseError, SupabaseStore, load_config
+from storage import IMAGE_TYPES, SQLiteStore, SupabaseAuth, SupabaseError, SupabaseStore, load_config
 from workflow import WorkflowBlocked, run_task_workflow
 
 
@@ -32,6 +33,8 @@ IMAGES_DIR = ROOT / ".local" / "images"
 IMAGE_NAME = re.compile(r"^[0-9a-f]{32}\.(png|jpg|gif|webp)$")
 MAX_REQUEST_BYTES = 100 * 1024
 MAX_ACTIVE_RUNS = 4
+# Messages per group kept in memory. Older ones stay in storage and load a page at a time.
+HISTORY_WINDOW = 200
 ACTIVE = {"queued", "running"}
 
 
@@ -113,7 +116,11 @@ def group_name(value: object) -> str:
 
 
 def general_group() -> dict:
-    return {"id": uuid.uuid4().hex, "name": "General", "bot_ids": [], "messages": [], "mode": "conversation", "master_id": "", "quality_criteria": ""}
+    return {"id": uuid.uuid4().hex, "name": "General", "bot_ids": [], "messages": [], "message_count": 0, "mode": "conversation", "master_id": "", "quality_criteria": ""}
+
+
+def message_count(group: dict) -> int:
+    return max(group.get("message_count", 0), len(group["messages"]))
 
 
 class Workspace:
@@ -149,6 +156,8 @@ class Workspace:
                         if isinstance(message.get("image"), str) and IMAGE_NAME.fullmatch(message["image"]):
                             messages[-1]["image"] = message["image"]
                 group = {"id": item["id"], "name": name, "bot_ids": list(dict.fromkeys(members)), "messages": messages}
+                saved_count = item.get("message_count")
+                group["message_count"] = max(saved_count if type(saved_count) is int else 0, len(messages))
                 group["mode"] = item.get("mode") if isinstance(item.get("mode"), str) and item.get("mode") in {"workflow", "conversation"} else "conversation"
                 group["master_id"] = item.get("master_id") if item.get("master_id") in members else next(iter(members), "")
                 group["quality_criteria"] = item.get("quality_criteria", "")[:4000] if isinstance(item.get("quality_criteria", ""), str) else ""
@@ -185,18 +194,39 @@ class Workspace:
             self.groups[0]["bot_ids"].append(bot["id"])
 
 
-def read_local_workspace() -> Workspace | None:
+def read_legacy_settings() -> tuple[Workspace, list] | None:
+    """The older settings.json, validated, with its saved runs."""
     try:
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
         local = Workspace()
-        local.apply(data if isinstance(data, dict) else {})
-        return local
+        local.apply(data)
+        runs = data.get("runs") if isinstance(data.get("runs"), list) else []
+        return local, [run for run in runs if isinstance(run, dict) and isinstance(run.get("id"), str) and isinstance(run.get("group_id"), str)]
     except (OSError, ValueError, TypeError, KeyError):
         return None
 
 
+def open_local_store() -> SQLiteStore:
+    """This computer's database, importing an older settings.json into it once."""
+    # Kept beside settings.json, so anything that relocates one relocates both.
+    store = SQLiteStore(SETTINGS_FILE.with_name("app.db"), IMAGES_DIR)
+    if SETTINGS_FILE.exists() and store.get_meta("settings_json_imported") is None:
+        legacy = read_legacy_settings()
+        if legacy is None:
+            print("settings.json could not be read, so it was not imported. The file is unchanged.")
+            return store
+        if store.is_empty():
+            workspace, runs = legacy
+            store.save_all(workspace.bots, workspace.groups, workspace.grants, runs)
+        # settings.json is left in place as a backup.
+        store.set_meta("settings_json_imported", now())
+    return store
+
+
 class State(Workspace):
-    def __init__(self) -> None:
+    def __init__(self, load: bool = True) -> None:
         super().__init__()
         self.lock = threading.RLock()
         self.token = secrets.token_urlsafe(32)
@@ -205,39 +235,38 @@ class State(Workspace):
         self.stop_events: dict[str, threading.Event] = {}
         self.events = EventHub()
         self.runner = RunManager(MAX_ACTIVE_RUNS)
-        self.store: LocalStore | SupabaseStore | None = LocalStore(self.save, IMAGES_DIR)
+        self.store: SQLiteStore | SupabaseStore | None = None
         # Set when Supabase is configured; the account is then required before any data loads.
         self.supabase: dict | None = None
-        self.load()
+        if load:
+            self.load()
 
     def load(self) -> None:
-        if not SETTINGS_FILE.exists():
-            return
+        store = open_local_store()
+        data: dict = {}
         try:
-            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("Invalid settings")
+            data = store.load(HISTORY_WINDOW)
             self.apply(data)
-            if self.restore_runs(data.get("runs")):
-                self.save()
-        except (OSError, ValueError, TypeError, KeyError):
-            print("Saved settings could not be loaded; starting with defaults.")
+        except (ValueError, TypeError, KeyError):
+            print("Saved data could not be read; starting with defaults.")
+            self.bots, self.groups, self.grants = [], [], []
+        self.store = store
+        if not self.groups:
+            self.groups = [general_group()]
+            store.put_group(self.groups[0])
+        for run in self.restore_runs(data.get("runs")):
+            store.put_run(run)
 
     def save(self) -> None:
-        if self.supabase is not None:
-            return  # Account data must never overwrite the local settings file.
-        SETTINGS_FILE.parent.mkdir(mode=0o700, exist_ok=True)
-        payload = {"version": 2, "bots": self.bots, "groups": self.groups, "grants": self.grants, "runs": list(self.runs.values())[-30:]}
-        temp = SETTINGS_FILE.with_suffix(".tmp")
-        temp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        temp.chmod(0o600)
-        temp.replace(SETTINGS_FILE)
+        """Write the whole workspace. Normal changes are saved one at a time through the store."""
+        if self.supabase is None and isinstance(self.store, SQLiteStore):
+            self.store.save_all(self.bots, self.groups, self.grants, list(self.runs.values()))
 
     def public(self) -> dict:
         with self.lock:
             return copy.deepcopy({
                 "bots": self.bots,
-                "groups": [{**{key: value for key, value in group.items() if key != "messages"}, "message_count": len(group["messages"])} for group in self.groups],
+                "groups": [{**{key: value for key, value in group.items() if key != "messages"}, "message_count": message_count(group)} for group in self.groups],
                 "grants": self.grants,
                 "key_status": {bot["id"]: bool(self.keys.get(bot["id"])) for bot in self.bots},
                 "runs": list(self.runs.values())[-30:][::-1],
@@ -268,24 +297,41 @@ class State(Workspace):
 
     def publish_message(self, group_id: str, message: dict) -> None:
         with self.lock:
-            count = len(self.group(group_id)["messages"])
+            count = message_count(self.group(group_id))
             self.events.publish("message", {"group_id": group_id, "message": message, "message_count": count})
+
+    def add_message(self, group: dict, message: dict) -> None:
+        """Record a new message. Memory keeps a recent window; the store keeps the full history."""
+        with self.lock:
+            count = message_count(group) + 1
+            group["messages"].append(message)
+            del group["messages"][:-HISTORY_WINDOW]
+            group["message_count"] = count
+            self.require_store().add_message(group["id"], message)
+            self.publish_message(group["id"], message)
 
     def messages_page(self, group_id: str, after: str, before: str, limit: int) -> dict:
         """The latest messages, those after a known message, or an older page before one."""
         with self.lock:
-            messages = self.group(group_id)["messages"]
-            ids = [message["id"] for message in messages]
-            reset = False
-            if after and after in ids:
-                window, has_more = messages[ids.index(after) + 1:], False
-            else:
-                # An unknown "after" means the browser's copy is stale, so it gets a fresh window.
-                reset = bool(after)
-                end = ids.index(before) if before in ids else len(messages)
-                start = max(0, end - limit)
-                window, has_more = messages[start:end], start > 0
-            return copy.deepcopy({"messages": window, "has_more": has_more, "total": len(messages), "reset": reset})
+            group = self.group(group_id)
+            window = copy.deepcopy(group["messages"])
+            total = message_count(group)
+            store = self.store
+        ids = [message["id"] for message in window]
+        if after and after in ids:
+            return {"messages": window[ids.index(after) + 1:], "has_more": False, "total": total, "reset": False}
+        if before:
+            end = ids.index(before) if before in ids else -1
+            if end >= limit:
+                return {"messages": window[end - limit:end], "has_more": True, "total": total, "reset": False}
+            # Older than the in-memory window: read that page from storage, outside the state lock.
+            if store is None:
+                raise UserError("Sign in to continue.")
+            messages, has_more = store.load_messages(group_id, before, limit)
+            return {"messages": messages, "has_more": has_more, "total": total, "reset": False}
+        # The latest page. An unknown "after" means the browser's copy is stale, so it starts again.
+        page = window[-limit:]
+        return {"messages": page, "has_more": total > len(page), "total": total, "reset": bool(after)}
 
     def _clear(self) -> None:
         for event in self.stop_events.values():
@@ -296,9 +342,12 @@ class State(Workspace):
     def use_supabase(self, config: dict) -> None:
         """Keep data in a Supabase account; nothing loads until someone signs in."""
         with self.lock:
+            previous = self.store
             self.supabase = config
             self.store = None
             self._clear()
+        if isinstance(previous, SQLiteStore):
+            previous.close()
 
     def signed_in(self) -> bool:
         return self.store is not None
@@ -309,10 +358,18 @@ class State(Workspace):
                 return {"mode": "local", "signed_in": True, "email": "", "can_import": False}
             if not isinstance(self.store, SupabaseStore):
                 return {"mode": "supabase", "signed_in": False, "email": "", "can_import": False}
-            empty = not self.bots and not any(group["messages"] for group in self.groups)
+            empty = not self.bots and not any(message_count(group) for group in self.groups)
             email = self.store.email
-        local = read_local_workspace() if empty else None
-        has_local = bool(local and (local.bots or any(group["messages"] for group in local.groups)))
+        has_local = False
+        if empty:
+            try:
+                local = open_local_store()
+                try:
+                    has_local = local.has_data()
+                finally:
+                    local.close()
+            except (OSError, sqlite3.Error):
+                pass
         return {"mode": "supabase", "signed_in": True, "email": email, "can_import": has_local}
 
     def sign_in(self, email: object, password: object) -> None:
@@ -323,7 +380,7 @@ class State(Workspace):
         session = SupabaseAuth(self.supabase).sign_in(email.strip(), password)
         store = SupabaseStore(self.supabase, session, GRANTS_FILE)
         try:
-            data = store.load()  # Network reads stay outside the state lock.
+            data = store.load(HISTORY_WINDOW)  # Network reads stay outside the state lock.
             account = Workspace()
             account.apply(data)
         except (ValueError, TypeError, KeyError):
@@ -357,8 +414,19 @@ class State(Workspace):
 
     def import_local(self) -> None:
         """Copy this computer's saved bots, chats, and images into the signed-in, still-empty account."""
-        local = read_local_workspace()
-        if local is None:
+        try:
+            source = open_local_store()
+        except (OSError, sqlite3.Error):
+            raise UserError("No local data was found to import.") from None
+        try:
+            data = source.load(HISTORY_WINDOW)
+            for group in data["groups"]:
+                group["messages"] = source.all_messages(group["id"])
+        finally:
+            source.close()
+        local = Workspace()
+        local.apply(data)
+        if not local.bots and not any(group["messages"] for group in local.groups):
             raise UserError("No local data was found to import.")
         images = {}
         for group in local.groups:
@@ -372,7 +440,7 @@ class State(Workspace):
             store = self.store
             if not isinstance(store, SupabaseStore):
                 raise UserError("Sign in before importing.")
-            if self.bots or any(group["messages"] for group in self.groups):
+            if self.bots or any(message_count(group) for group in self.groups):
                 raise UserError("This account already has data, so nothing was imported.")
             for group in self.groups:
                 store.delete_group(group["id"])
@@ -384,6 +452,8 @@ class State(Workspace):
                 store.put_group(group)
                 for message in group["messages"]:
                     store.add_message(group["id"], message)
+                group["message_count"] = len(group["messages"])
+                del group["messages"][:-HISTORY_WINDOW]
             for name, data in images.items():
                 store.upload_image(name, data)
             store.put_grants(self.grants)
@@ -392,7 +462,7 @@ class State(Workspace):
         if self.store is not None:
             self.store.close()
 
-    def require_store(self) -> LocalStore | SupabaseStore:
+    def require_store(self) -> SQLiteStore | SupabaseStore:
         store = self.store
         if store is None:
             raise UserError("Sign in to continue.")
@@ -411,7 +481,8 @@ class State(Workspace):
         raise UserError("Group chat not found.")
 
 
-STATE = State()
+# Storage opens in main(), so importing this module (as the tests do) never touches saved data.
+STATE = State(load=False)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -535,6 +606,9 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid message range."})
                 return
+            except OSError as error:
+                self._json(HTTPStatus.BAD_GATEWAY, {"error": f"Older messages could not be loaded: {error}"})
+                return
             self._json(HTTPStatus.OK, page)
         elif path.path.startswith("/api/runs/"):
             run_id = path.path.rsplit("/", 1)[-1]
@@ -605,7 +679,7 @@ class Handler(BaseHTTPRequestHandler):
             elif len(parts) >= 3 and parts[:2] == ["api", "bots"]:
                 self._bot_action(parts[2:], body)
             elif parts == ["api", "groups"]:
-                item = {"id": uuid.uuid4().hex, "name": group_name(body.get("name", "New group")), "bot_ids": [], "messages": [], "mode": "workflow", "master_id": "", "quality_criteria": ""}
+                item = {"id": uuid.uuid4().hex, "name": group_name(body.get("name", "New group")), "bot_ids": [], "messages": [], "message_count": 0, "mode": "workflow", "master_id": "", "quality_criteria": ""}
                 with STATE.lock:
                     STATE.groups.append(item)
                     STATE.require_store().put_group(item)
@@ -773,7 +847,7 @@ class Handler(BaseHTTPRequestHandler):
             files = read_allowed_files(body.get("files", []), STATE.grants)
             store = STATE.require_store()
             user_message = {"id": uuid.uuid4().hex, "sender": "You", "bot_id": "", "text": message.strip(), "created_at": now(), "files": [path for path, _ in files]}
-            group["messages"].append(user_message)
+            STATE.add_message(group, user_message)
             history = copy.deepcopy(group["messages"])
             group_title = group["name"]
             run_id = uuid.uuid4().hex
@@ -787,8 +861,6 @@ class Handler(BaseHTTPRequestHandler):
                 if finished is None:
                     break
                 STATE.runs.pop(finished)
-            store.add_message(group_id, user_message)
-            STATE.publish_message(group_id, user_message)
             STATE.publish_run(run_id, persist=True)
             runner = STATE.runner
         runner.submit(lambda: execute_group_run(run_id, group_id, group_title, bots, history, files, keys))
@@ -854,10 +926,8 @@ def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[d
         with STATE.lock:
             if not accepting():
                 return
-            STATE.group(group_id)["messages"].append(complete)
             STATE.runs[run_id]["completed"] += 1
-            STATE.require_store().add_message(group_id, complete)
-            STATE.publish_message(group_id, complete)
+            STATE.add_message(STATE.group(group_id), complete)
             STATE.publish_run(run_id, persist=True)
 
     try:
@@ -907,6 +977,8 @@ def main() -> None:
         raise SystemExit(f"Supabase settings error: {error}") from None
     if supabase:
         STATE.use_supabase(supabase)
+    else:
+        STATE.load()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{server.server_port}/bots?token={STATE.token}"
     print(f"Local Agent Studio: {url}", flush=True)

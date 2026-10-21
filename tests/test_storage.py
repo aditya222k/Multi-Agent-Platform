@@ -60,14 +60,32 @@ class FakeSupabase:
             return b"{}"
         raise AssertionError(f"Unexpected request {method} {url}")
 
+    @staticmethod
+    def matches(row, key, value):
+        operator, _, operand = value.partition(".")
+        if operator == "eq":
+            return str(row.get(key)) == operand
+        if operator == "lt":
+            return row.get(key) < int(operand)
+        raise AssertionError(f"Unsupported filter {key}={value}")
+
     def rest(self, method, table, query, data):
         if table in self.missing:
             raise storage.SupabaseError(404, f'relation "public.{table}" does not exist')
+        if method == "GET" and table == "message_counts":
+            counts = {}
+            for row in self.tables["messages"]:
+                counts[row["group_id"]] = counts.get(row["group_id"], 0) + 1
+            return json.dumps([{"group_id": group_id, "message_count": count} for group_id, count in counts.items()]).encode()
         rows = self.tables[table]
         if method == "GET":
-            offset, limit = int(query["offset"]), int(query["limit"])
-            if query.get("order") == "updated_at.desc":
-                rows = sorted(rows, key=lambda row: row["updated_at"], reverse=True)
+            filters = {key: value for key, value in query.items() if key not in {"select", "order", "limit", "offset"}}
+            rows = [row for row in rows if all(self.matches(row, key, value) for key, value in filters.items())]
+            if query.get("order"):
+                column, _, direction = query["order"].split(",")[0].partition(".")
+                rows = sorted(rows, key=lambda row: row.get(column) or "", reverse=direction == "desc")
+            offset = int(query.get("offset", 0))
+            limit = int(query.get("limit", len(rows)))
             columns = query["select"].split(",")
             return json.dumps([{column: row.get(column) for column in columns} for row in rows[offset:offset + limit]]).encode()
         if method == "POST":
@@ -138,7 +156,7 @@ class SupabaseStoreTests(unittest.TestCase):
             store.add_message("g1", {"id": f"m{index}", "sender": "You", "bot_id": "", "text": f"Hello {index}", "created_at": "", "files": []})
         self.assertTrue(store.flush(2))
         self.assertTrue(all(row["owner_id"] == "user-1" for table in self.fake.tables.values() for row in table))
-        data = self.store().load()
+        data = self.store().load(200)
         self.assertEqual(data["bots"][0]["id"], "bot-1")
         self.assertEqual(data["groups"][0]["bot_ids"], ["bot-1"])
         self.assertEqual([m["text"] for m in data["groups"][0]["messages"]], ["Hello 0", "Hello 1", "Hello 2"])
@@ -150,12 +168,12 @@ class SupabaseStoreTests(unittest.TestCase):
             store.add_message("g1", {"id": f"m{index}", "sender": "You", "text": str(index), "files": []})
         store.flush(2)
         with patch.object(storage, "PAGE_SIZE", 2):
-            messages = self.store().load()["groups"][0]["messages"]
+            messages = self.store().load(200)["groups"][0]["messages"]
         self.assertEqual([m["text"] for m in messages], ["0", "1", "2", "3", "4"])
 
     def test_expired_token_is_refreshed_before_a_request(self):
         store = self.store(session(expires_in=-10))
-        store.load()
+        store.load(200)
         self.assertEqual(self.fake.calls[0][1], "/auth/v1/token")
         self.assertEqual(self.fake.calls[0][2]["grant_type"], "refresh_token")
         self.assertGreater(store.session["expires_at"], time.time())
@@ -173,7 +191,7 @@ class SupabaseStoreTests(unittest.TestCase):
         store = self.store()
         self.fake.fail_next = 404
         with self.assertRaisesRegex(core.UserError, "schema.sql"):
-            store.load()
+            store.load(200)
 
     def test_images_upload_to_the_users_folder_and_load_back(self):
         store = self.store()

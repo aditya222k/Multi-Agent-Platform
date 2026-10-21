@@ -43,6 +43,12 @@ create table if not exists public.messages (
 
 create index if not exists messages_group_order on public.messages (owner_id, group_id, seq);
 
+-- Message totals per group, so the app can show counts without loading every message.
+-- security_invoker applies the messages table's row-level security to whoever reads the view.
+create or replace view public.message_counts with (security_invoker = true) as
+  select owner_id, group_id, count(*) as message_count from public.messages group by owner_id, group_id;
+grant select on public.message_counts to authenticated;
+
 -- Recent conversation and workflow runs, so their outcome survives an app restart.
 create table if not exists public.runs (
   owner_id uuid not null default auth.uid() references auth.users (id) on delete cascade,

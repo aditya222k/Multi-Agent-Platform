@@ -1,4 +1,4 @@
-"""Where bots, groups, and messages are kept: a local JSON file or a Supabase account."""
+"""Where bots, groups, and messages are kept: a local SQLite file or a Supabase account."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import queue
+import sqlite3
 import threading
 import time
 import urllib.error
@@ -14,7 +15,6 @@ import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
 from urllib.parse import quote, urlencode, urlsplit
 
 from core import UserError, _NoRedirect, _error_message, _tls_context
@@ -26,6 +26,7 @@ RECENT_IMAGES = 24
 RECENT_RUNS = 30
 UPSERT = {"Prefer": "resolution=merge-duplicates,return=minimal"}
 IMAGE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
+MESSAGE_COLUMNS = "id,sender,bot_id,text,image,files,created_at"
 
 
 def load_config(root: Path) -> dict | None:
@@ -134,33 +135,139 @@ class SupabaseAuth:
             pass  # The local session is discarded either way.
 
 
-class LocalStore:
-    """The original single JSON file; every change rewrites it."""
+class SQLiteStore:
+    """This computer's data in one SQLite file. Each change is one short transaction."""
 
     kind = "local"
     error = ""
 
-    def __init__(self, save: Callable[[], None], images_dir: Path):
-        self._save = save
+    SCHEMA = """
+        create table if not exists meta (key text primary key, value text not null);
+        create table if not exists bots (id text primary key, data text not null);
+        create table if not exists groups (id text primary key, data text not null);
+        create table if not exists messages (seq integer primary key autoincrement, id text not null unique, group_id text not null, data text not null);
+        create index if not exists messages_by_group on messages (group_id, seq);
+        create table if not exists runs (id text primary key, created_at real not null default 0, data text not null);
+        create table if not exists grants (path text primary key);
+    """
+
+    def __init__(self, path: Path, images_dir: Path):
+        self.path = path
         self.images_dir = images_dir
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not path.exists():
+            # Owner-only from the start; SQLite gives its WAL files the same permissions.
+            os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+        self._lock = threading.Lock()
+        self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._db.execute("pragma journal_mode=wal")
+        self._db.execute("pragma busy_timeout=5000")
+        self._db.executescript(self.SCHEMA)
+
+    def _write(self, statements: list[tuple[str, tuple]]) -> None:
+        with self._lock:
+            try:
+                self._db.execute("begin immediate")
+                try:
+                    for sql, args in statements:
+                        self._db.execute(sql, args)
+                    self._db.execute("commit")
+                except BaseException:
+                    self._db.execute("rollback")
+                    raise
+            except sqlite3.Error as error:
+                raise OSError(f"Local database write failed: {error}") from None
+
+    def _read(self, sql: str, args: tuple = ()) -> list[tuple]:
+        with self._lock:
+            return self._db.execute(sql, args).fetchall()
+
+    @staticmethod
+    def _bot_row(bot: dict) -> tuple:
+        return bot["id"], json.dumps({key: value for key, value in bot.items() if key != "id"}, ensure_ascii=False)
+
+    @staticmethod
+    def _group_row(group: dict) -> tuple:
+        return group["id"], json.dumps({key: value for key, value in group.items() if key not in {"messages", "message_count"}}, ensure_ascii=False)
+
+    @staticmethod
+    def _message_row(group_id: str, message: dict) -> tuple:
+        return message["id"], group_id, json.dumps(message, ensure_ascii=False)
+
+    def get_meta(self, key: str) -> str | None:
+        rows = self._read("select value from meta where key = ?", (key,))
+        return rows[0][0] if rows else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._write([("insert into meta (key, value) values (?, ?) on conflict (key) do update set value = excluded.value", (key, value))])
+
+    def has_data(self) -> bool:
+        return bool(self._read("select exists (select 1 from bots) or exists (select 1 from messages)")[0][0])
+
+    def is_empty(self) -> bool:
+        return not self._read("select exists (select 1 from bots) or exists (select 1 from groups) or exists (select 1 from messages)")[0][0]
+
+    def load(self, window: int) -> dict:
+        """Bots, groups with their latest messages and totals, grants, and recent runs."""
+        bots = [{**json.loads(data), "id": bot_id} for bot_id, data in self._read("select id, data from bots order by rowid")]
+        groups = []
+        for group_id, data in self._read("select id, data from groups order by rowid"):
+            recent = self._read("select data from messages where group_id = ? order by seq desc limit ?", (group_id, window))
+            count = self._read("select count(*) from messages where group_id = ?", (group_id,))[0][0]
+            groups.append({**json.loads(data), "id": group_id, "messages": [json.loads(row[0]) for row in reversed(recent)], "message_count": count})
+        grants = [row[0] for row in self._read("select path from grants order by rowid")]
+        runs = [json.loads(row[0]) for row in reversed(self._read("select data from runs order by created_at desc limit ?", (RECENT_RUNS,)))]
+        return {"bots": bots, "groups": groups, "grants": grants, "runs": runs}
+
+    def load_messages(self, group_id: str, before_id: str, limit: int) -> tuple[list[dict], bool]:
+        """Up to limit messages older than before_id, oldest first, and whether even older ones exist."""
+        seq = self._read("select seq from messages where id = ? and group_id = ?", (before_id, group_id))
+        if not seq:
+            return [], False
+        rows = self._read("select data from messages where group_id = ? and seq < ? order by seq desc limit ?", (group_id, seq[0][0], limit + 1))
+        return [json.loads(row[0]) for row in reversed(rows[:limit])], len(rows) > limit
+
+    def all_messages(self, group_id: str) -> list[dict]:
+        return [json.loads(row[0]) for row in self._read("select data from messages where group_id = ? order by seq", (group_id,))]
 
     def put_bot(self, bot: dict) -> None:
-        self._save()
+        self._write([("insert into bots (id, data) values (?, ?) on conflict (id) do update set data = excluded.data", self._bot_row(bot))])
 
     def delete_bot(self, bot_id: str) -> None:
-        self._save()
+        self._write([("delete from bots where id = ?", (bot_id,))])
 
     def put_group(self, group: dict) -> None:
-        self._save()
+        self._write([("insert into groups (id, data) values (?, ?) on conflict (id) do update set data = excluded.data", self._group_row(group))])
+
+    def delete_group(self, group_id: str) -> None:
+        self._write([("delete from messages where group_id = ?", (group_id,)), ("delete from groups where id = ?", (group_id,))])
 
     def add_message(self, group_id: str, message: dict) -> None:
-        self._save()
+        self._write([("insert or ignore into messages (id, group_id, data) values (?, ?, ?)", self._message_row(group_id, message))])
 
     def put_grants(self, grants: list[str]) -> None:
-        self._save()
+        self._write([("delete from grants", ())] + [("insert or ignore into grants (path) values (?)", (path,)) for path in grants])
 
     def put_run(self, run: dict) -> None:
-        self._save()
+        self._write([("insert into runs (id, created_at, data) values (?, ?, ?) on conflict (id) do update set data = excluded.data",
+                      (run["id"], float(run.get("created_at") or 0), json.dumps(run, ensure_ascii=False)))])
+
+    def save_all(self, bots: list[dict], groups: list[dict], grants: list[str], runs: list[dict]) -> None:
+        """Write a whole workspace in one transaction, removing bots and groups it no longer has."""
+        statements: list[tuple[str, tuple]] = []
+        bot_ids, group_ids = [bot["id"] for bot in bots], [group["id"] for group in groups]
+        statements.append((f"delete from bots where id not in ({','.join('?' * len(bot_ids))})", tuple(bot_ids)))
+        statements.append((f"delete from messages where group_id not in ({','.join('?' * len(group_ids))})", tuple(group_ids)))
+        statements.append((f"delete from groups where id not in ({','.join('?' * len(group_ids))})", tuple(group_ids)))
+        statements += [("insert into bots (id, data) values (?, ?) on conflict (id) do update set data = excluded.data", self._bot_row(bot)) for bot in bots]
+        for group in groups:
+            statements.append(("insert into groups (id, data) values (?, ?) on conflict (id) do update set data = excluded.data", self._group_row(group)))
+            statements += [("insert or ignore into messages (id, group_id, data) values (?, ?, ?)", self._message_row(group["id"], message)) for message in group["messages"]]
+        statements.append(("delete from grants", ()))
+        statements += [("insert or ignore into grants (path) values (?)", (path,)) for path in grants]
+        statements += [("insert into runs (id, created_at, data) values (?, ?, ?) on conflict (id) do update set data = excluded.data",
+                        (run["id"], float(run.get("created_at") or 0), json.dumps(run, ensure_ascii=False))) for run in runs]
+        self._write(statements)
 
     def save_image(self, data: bytes, kind: str) -> str:
         self.images_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -174,7 +281,8 @@ class LocalStore:
         return (self.images_dir / name).read_bytes()
 
     def close(self) -> None:
-        pass
+        with self._lock:
+            self._db.close()
 
 
 class SupabaseStore:
@@ -228,25 +336,53 @@ class SupabaseStore:
             if len(page) < PAGE_SIZE:
                 return rows
 
-    def load(self) -> dict:
-        """The account's data in the same shape as the local settings file."""
+    @staticmethod
+    def _clean_message(row: dict) -> dict:
+        return {key: value for key, value in row.items() if key not in {"group_id", "seq"} and value is not None}
+
+    def _messages(self, params: dict) -> list[dict]:
+        rows = json.loads(self._request("GET", "/rest/v1/messages", params=params))
+        if not isinstance(rows, list):
+            raise SupabaseError(0, "Supabase returned an unexpected messages response.")
+        return rows
+
+    def load(self, window: int) -> dict:
+        """Bots, groups with only their latest messages and totals, grants, and recent runs."""
         try:
             bots = [{**row["data"], "id": row["id"]} for row in self._rows("bots", "id,data", "created_at.asc,id.asc") if isinstance(row.get("data"), dict)]
             groups = self._rows("groups", "id,name,mode,master_id,quality_criteria,bot_ids,last_workflow", "created_at.asc,id.asc")
-            messages = self._rows("messages", "id,group_id,sender,bot_id,text,image,files,created_at", "seq.asc")
+            counts = self._message_counts()
+            for group in groups:
+                # One extra row tells whether older messages exist even without the counts view.
+                recent = self._messages({"select": MESSAGE_COLUMNS, "group_id": f"eq.{group['id']}", "order": "seq.desc", "limit": window + 1})
+                group["messages"] = [self._clean_message(row) for row in reversed(recent[:window])]
+                group["message_count"] = counts.get(group["id"], len(recent))
+                if group.get("last_workflow") is None:
+                    group.pop("last_workflow", None)
         except SupabaseError as error:
             if error.status == 404 or "does not exist" in str(error) or "schema cache" in str(error):
                 raise SupabaseError(error.status, "The Supabase tables are missing. Run supabase/schema.sql in the Supabase SQL editor first.") from None
             raise
-        by_group: dict[str, list[dict]] = {}
-        for message in messages:
-            item = {key: value for key, value in message.items() if key != "group_id" and value is not None}
-            by_group.setdefault(message["group_id"], []).append(item)
-        for group in groups:
-            group["messages"] = by_group.get(group["id"], [])
-            if group.get("last_workflow") is None:
-                group.pop("last_workflow", None)
         return {"bots": bots, "groups": groups, "grants": self._read_grants(), "runs": self._recent_runs()}
+
+    def _message_counts(self) -> dict[str, int]:
+        try:
+            rows = json.loads(self._request("GET", "/rest/v1/message_counts", params={"select": "group_id,message_count"}))
+        except SupabaseError as error:
+            self.error = f"Message totals are unavailable: run supabase/schema.sql again in the Supabase SQL editor. ({error})"
+            return {}
+        return {row["group_id"]: int(row["message_count"]) for row in rows if isinstance(row, dict) and "group_id" in row}
+
+    def load_messages(self, group_id: str, before_id: str, limit: int) -> tuple[list[dict], bool]:
+        """Up to limit messages older than before_id, oldest first, and whether even older ones exist."""
+        try:
+            anchor = self._messages({"select": "seq", "id": f"eq.{before_id}", "group_id": f"eq.{group_id}", "limit": 1})
+            if not anchor:
+                return [], False
+            rows = self._messages({"select": MESSAGE_COLUMNS, "group_id": f"eq.{group_id}", "seq": f"lt.{anchor[0]['seq']}", "order": "seq.desc", "limit": limit + 1})
+        except SupabaseError as error:
+            raise OSError(str(error)) from None
+        return [self._clean_message(row) for row in reversed(rows[:limit])], len(rows) > limit
 
     def _recent_runs(self) -> list[dict]:
         try:

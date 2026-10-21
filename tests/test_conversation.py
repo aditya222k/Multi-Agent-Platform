@@ -190,6 +190,8 @@ class ConversationAPITests(unittest.TestCase):
             self.state.keys[name] = "test-key"
         self.group = self.state.groups[0]
         self.group["bot_ids"] = ["Host", "Expert"]
+        # The bots above were created in memory, so write them to storage like the API would.
+        self.state.save()
         state_patch = patch.object(app, "STATE", self.state)
         state_patch.start()
         self.addCleanup(state_patch.stop)

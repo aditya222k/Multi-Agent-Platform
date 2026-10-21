@@ -9,7 +9,7 @@ import core
 
 
 class SettingsTests(unittest.TestCase):
-    def test_per_bot_api_keys_never_enter_settings_file(self):
+    def test_per_bot_api_keys_never_reach_local_storage(self):
         with tempfile.TemporaryDirectory() as temp:
             settings = Path(temp) / "settings.json"
             with patch.object(app, "SETTINGS_FILE", settings):
@@ -19,9 +19,10 @@ class SettingsTests(unittest.TestCase):
                 state.groups[0]["bot_ids"].append(bot["id"])
                 state.keys[bot["id"]] = "private-test-key"
                 state.save()
-                text = settings.read_text(encoding="utf-8")
-                self.assertNotIn("private-test-key", text)
-                self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
+                state.close()
+                for file in Path(temp).iterdir():
+                    self.assertNotIn(b"private-test-key", file.read_bytes(), file.name)
+                self.assertEqual((Path(temp) / "app.db").stat().st_mode & 0o777, 0o600)
                 reloaded = app.State()
                 self.assertEqual(reloaded.groups[0]["bot_ids"], ["bot-one"])
                 self.assertFalse(reloaded.keys.get("bot-one"))

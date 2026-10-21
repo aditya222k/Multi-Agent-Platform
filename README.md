@@ -114,7 +114,8 @@ If the account is empty and this computer has local data, the app offers to impo
 
 - The server binds to `127.0.0.1` only and requires a random launch token.
 - **API keys live in server memory only.** Re-enter them after a restart.
-- Without Supabase, bot settings, chat history, and allowed file paths are stored in `.local/settings.json` with owner-only permissions. Git ignores this file and `.env`.
+- Without Supabase, bot settings, chat history, run history, and allowed file paths are stored in a SQLite database, `.local/app.db`, with owner-only permissions. Git ignores `.local/` and `.env`. An older `.local/settings.json` is imported once on first start and left in place as a backup.
+- The server keeps only the latest 200 messages per group in memory. Older messages stay in storage and load a page at a time.
 - With Supabase, bots, chats, and generated images are sent to your Supabase project, protected by row-level security. Allowed file paths stay in `.local/grants.json`.
 - HTTPS certificates are verified. On macOS without default certificates, `/etc/ssl/cert.pem` is used. `SSL_CERT_FILE` and `SSL_CERT_DIR` take precedence.
 - File content you share is sent to the API endpoints of the bots in that group.
@@ -125,7 +126,7 @@ If the account is empty and this computer has local data, the app offers to impo
 static/        Frontend (index.html, app.js, style.css)
 app.py         HTTP server, saved state, sign-in, and background conversation runs
 core.py        Bot validation, prompt building, model API calls, file access
-storage.py     Local JSON storage or a Supabase account (auth, tables, images)
+storage.py     Local SQLite storage or a Supabase account (auth, tables, images)
 workflow.py    Approval-gated task workflow engine
 supabase/      Schema to run once in the Supabase SQL editor
 tests/         Unit tests using local fakes
