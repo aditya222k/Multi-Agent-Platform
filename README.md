@@ -139,6 +139,7 @@ tests/         Unit tests using local fakes
 - Bots can't run tools or change files. Image bots can generate pictures, but no bot can read images.
 - Requests already sent when you press Stop may still finish, and the provider may still bill you for them. Their replies are discarded.
 - Bot or membership changes made during a run take effect on the next run.
+- Up to 4 groups run at once, with at most 3 model calls in flight across all of them. Further runs wait as **Queued**. If the app stops mid-run, that run shows as **Interrupted** after a restart.
 
 ## Running tests
 

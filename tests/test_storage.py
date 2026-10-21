@@ -25,7 +25,8 @@ class FakeSupabase:
 
     def __init__(self, password="secret"):
         self.password = password
-        self.tables = {"bots": [], "groups": [], "messages": []}
+        self.tables = {"bots": [], "groups": [], "messages": [], "runs": []}
+        self.missing = set()
         self.objects = {}
         self.calls = []
         self.fail_next = None
@@ -60,9 +61,13 @@ class FakeSupabase:
         raise AssertionError(f"Unexpected request {method} {url}")
 
     def rest(self, method, table, query, data):
+        if table in self.missing:
+            raise storage.SupabaseError(404, f'relation "public.{table}" does not exist')
         rows = self.tables[table]
         if method == "GET":
             offset, limit = int(query["offset"]), int(query["limit"])
+            if query.get("order") == "updated_at.desc":
+                rows = sorted(rows, key=lambda row: row["updated_at"], reverse=True)
             columns = query["select"].split(",")
             return json.dumps([{column: row.get(column) for column in columns} for row in rows[offset:offset + limit]]).encode()
         if method == "POST":

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import queue
 import re
 import secrets
 import subprocess
@@ -30,6 +31,8 @@ GRANTS_FILE = ROOT / ".local" / "grants.json"
 IMAGES_DIR = ROOT / ".local" / "images"
 IMAGE_NAME = re.compile(r"^[0-9a-f]{32}\.(png|jpg|gif|webp)$")
 MAX_REQUEST_BYTES = 100 * 1024
+MAX_ACTIVE_RUNS = 4
+ACTIVE = {"queued", "running"}
 
 
 class EventHub:
@@ -68,6 +71,35 @@ class EventHub:
         with self.condition:
             self.closed = True
             self.condition.notify_all()
+
+
+class RunManager:
+    """A fixed pool of workers; runs beyond the pool wait their turn as "queued"."""
+
+    def __init__(self, workers: int) -> None:
+        self.workers = workers
+        self.jobs: queue.Queue = queue.Queue()
+        self._started = False
+        self._lock = threading.Lock()
+
+    def submit(self, job) -> None:
+        with self._lock:
+            if not self._started:
+                # Workers start on first use, so creating a State costs no threads.
+                for _ in range(self.workers):
+                    threading.Thread(target=self._work, daemon=True).start()
+                self._started = True
+        self.jobs.put(job)
+
+    def _work(self) -> None:
+        while True:
+            job = self.jobs.get()
+            try:
+                job()
+            except Exception:
+                pass  # execute_group_run records its own failures on the run.
+            finally:
+                self.jobs.task_done()
 
 
 def now() -> str:
@@ -172,6 +204,7 @@ class State(Workspace):
         self.runs: dict[str, dict] = {}
         self.stop_events: dict[str, threading.Event] = {}
         self.events = EventHub()
+        self.runner = RunManager(MAX_ACTIVE_RUNS)
         self.store: LocalStore | SupabaseStore | None = LocalStore(self.save, IMAGES_DIR)
         # Set when Supabase is configured; the account is then required before any data loads.
         self.supabase: dict | None = None
@@ -185,6 +218,8 @@ class State(Workspace):
             if not isinstance(data, dict):
                 raise ValueError("Invalid settings")
             self.apply(data)
+            if self.restore_runs(data.get("runs")):
+                self.save()
         except (OSError, ValueError, TypeError, KeyError):
             print("Saved settings could not be loaded; starting with defaults.")
 
@@ -192,7 +227,7 @@ class State(Workspace):
         if self.supabase is not None:
             return  # Account data must never overwrite the local settings file.
         SETTINGS_FILE.parent.mkdir(mode=0o700, exist_ok=True)
-        payload = {"version": 2, "bots": self.bots, "groups": self.groups, "grants": self.grants}
+        payload = {"version": 2, "bots": self.bots, "groups": self.groups, "grants": self.grants, "runs": list(self.runs.values())[-30:]}
         temp = SETTINGS_FILE.with_suffix(".tmp")
         temp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         temp.chmod(0o600)
@@ -210,11 +245,26 @@ class State(Workspace):
                 "sync_error": getattr(self.store, "error", ""),
             })
 
-    def publish_run(self, run_id: str) -> None:
+    def restore_runs(self, raw: object) -> list[dict]:
+        """Load saved runs. Ones that were queued or running when the app stopped become "interrupted"."""
+        saved = [run for run in raw if isinstance(run, dict) and all(isinstance(run.get(key), str) for key in ("id", "group_id", "status"))] if isinstance(raw, list) else []
+        saved.sort(key=lambda run: run.get("created_at") or 0)
+        interrupted = []
+        for run in saved[-30:]:
+            if run["status"] in ACTIVE:
+                run.update(status="interrupted", error="The app stopped before this run finished.", current_bot="", waiting_reason="")
+                interrupted.append(run)
+            self.runs[run["id"]] = run
+        return interrupted
+
+    def publish_run(self, run_id: str, persist: bool = False) -> None:
         with self.lock:
             run = self.runs.get(run_id)
-            if run is not None:
-                self.events.publish("run", {"run": run, "sync_error": getattr(self.store, "error", "")})
+            if run is None:
+                return
+            if persist and self.store is not None:
+                self.store.put_run(run)
+            self.events.publish("run", {"run": run, "sync_error": getattr(self.store, "error", "")})
 
     def publish_message(self, group_id: str, message: dict) -> None:
         with self.lock:
@@ -286,6 +336,8 @@ class State(Workspace):
             previous = self.store
             self._clear()
             self.bots, self.groups, self.grants = account.bots, account.groups, account.grants
+            for run in self.restore_runs(data.get("runs")):
+                store.put_run(run)
             if not self.groups:
                 self.groups = [general_group()]
                 store.put_group(self.groups[0])
@@ -636,13 +688,17 @@ class Handler(BaseHTTPRequestHandler):
             with STATE.lock:
                 STATE.group(group_id)
                 for run in STATE.runs.values():
-                    if run["group_id"] == group_id and run["status"] == "running":
-                        STATE.stop_events[run["id"]].set()
-                        run.update(status="stopped", completion_reason="stopped", current_bot="")
+                    if run["group_id"] == group_id and run["status"] in ACTIVE:
+                        if run["status"] == "queued":
+                            # It never started, so no worker will clear its stop event.
+                            STATE.stop_events.pop(run["id"], None)
+                        elif run["id"] in STATE.stop_events:
+                            STATE.stop_events[run["id"]].set()
+                        run.update(status="stopped", completion_reason="stopped", current_bot="", waiting_reason="")
                         if run.get("workflow"):
                             run["workflow"]["phase"] = "stopped"
                             STATE.group(group_id)["last_workflow"] = copy.deepcopy(run["workflow"])
-                        STATE.publish_run(run["id"])
+                        STATE.publish_run(run["id"], persist=True)
                 STATE.require_store().put_group(STATE.group(group_id))
             self._json(HTTPStatus.OK, STATE.public())
             return
@@ -701,7 +757,7 @@ class Handler(BaseHTTPRequestHandler):
                 if duration:
                     raise UserError("Task workflows finish through approvals, not a duration.")
                 continuous = False
-            if any(run["group_id"] == group_id and run["status"] == "running" for run in STATE.runs.values()):
+            if any(run["group_id"] == group_id and run["status"] in ACTIVE for run in STATE.runs.values()):
                 raise UserError("This group is already responding. Wait for its current turn.")
             bots = [copy.deepcopy(STATE.bot(bot_id)) for bot_id in group["bot_ids"]]
             if not bots:
@@ -721,31 +777,42 @@ class Handler(BaseHTTPRequestHandler):
             history = copy.deepcopy(group["messages"])
             group_title = group["name"]
             run_id = uuid.uuid4().hex
-            STATE.runs[run_id] = {"id": run_id, "group_id": group_id, "status": "running", "completed": 0, "total": len(bots), "error": "", "continuous": continuous, "duration_seconds": duration, "ends_at": time.time() + duration if duration else None, "current_bot": "", "completion_reason": ""}
+            STATE.runs[run_id] = {"id": run_id, "group_id": group_id, "status": "queued", "created_at": time.time(), "completed": 0, "total": len(bots), "error": "", "continuous": continuous, "duration_seconds": duration, "ends_at": time.time() + duration if duration else None, "current_bot": "", "completion_reason": ""}
             STATE.runs[run_id].update(mode=mode, master_id=master_id, quality_criteria=group.get("quality_criteria", ""))
             if mode == "workflow" and group.pop("last_workflow", None) is not None:
                 store.put_group(group)
             STATE.stop_events[run_id] = threading.Event()
             while len(STATE.runs) > 30:
-                finished = next((key for key, run in STATE.runs.items() if run["status"] != "running" and key not in STATE.stop_events), None)
+                finished = next((key for key, run in STATE.runs.items() if run["status"] not in ACTIVE and key not in STATE.stop_events), None)
                 if finished is None:
                     break
                 STATE.runs.pop(finished)
             store.add_message(group_id, user_message)
             STATE.publish_message(group_id, user_message)
-            STATE.publish_run(run_id)
-        threading.Thread(target=execute_group_run, args=(run_id, group_id, group_title, bots, history, files, keys), daemon=True).start()
+            STATE.publish_run(run_id, persist=True)
+            runner = STATE.runner
+        runner.submit(lambda: execute_group_run(run_id, group_id, group_title, bots, history, files, keys))
         self._json(HTTPStatus.ACCEPTED, {"run_id": run_id})
 
 
 def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[dict], history: list[dict], files: list[tuple[str, str]], keys: dict[str, str]) -> None:
     with STATE.lock:
-        duration = STATE.runs[run_id]["duration_seconds"]
-        continuous = STATE.runs[run_id]["continuous"]
-        mode = STATE.runs[run_id].get("mode", "conversation")
-        master_id = STATE.runs[run_id].get("master_id")
-        quality_criteria = STATE.runs[run_id].get("quality_criteria", "")
+        run = STATE.runs.get(run_id)
+        if run is None or run["status"] != "queued" or run_id not in STATE.stop_events:
+            # Stopped, or signed out, while it waited in the queue.
+            STATE.stop_events.pop(run_id, None)
+            return
+        run.update(status="running", started_at=time.time())
+        duration = run["duration_seconds"]
+        if duration:
+            # A timed run's clock starts when it leaves the queue.
+            run["ends_at"] = time.time() + duration
+        continuous = run["continuous"]
+        mode = run.get("mode", "conversation")
+        master_id = run.get("master_id")
+        quality_criteria = run.get("quality_criteria", "")
         stop_event = STATE.stop_events[run_id]
+        STATE.publish_run(run_id, persist=True)
 
     def on_turn(bot: dict) -> None:
         with STATE.lock:
@@ -769,7 +836,7 @@ def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[d
                 group = STATE.group(group_id)
                 group["last_workflow"] = copy.deepcopy(progress)
                 STATE.require_store().put_group(group)
-                STATE.publish_run(run_id)
+                STATE.publish_run(run_id, persist=True)
 
     def accepting() -> bool:
         run = STATE.runs.get(run_id)
@@ -791,7 +858,7 @@ def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[d
             STATE.runs[run_id]["completed"] += 1
             STATE.require_store().add_message(group_id, complete)
             STATE.publish_message(group_id, complete)
-            STATE.publish_run(run_id)
+            STATE.publish_run(run_id, persist=True)
 
     try:
         if mode == "workflow":
@@ -826,7 +893,7 @@ def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[d
     finally:
         with STATE.lock:
             STATE.stop_events.pop(run_id, None)
-            STATE.publish_run(run_id)
+            STATE.publish_run(run_id, persist=True)
 
 
 def main() -> None:

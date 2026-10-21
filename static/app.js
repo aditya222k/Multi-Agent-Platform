@@ -230,6 +230,9 @@ function selectGroup(id) {
 }
 
 function latestRun(groupId) { return state.runs.find((run) => run.group_id === groupId); }
+function isActive(run) { return !!run && ['queued', 'running'].includes(run.status); }
+// How many runs, in any group, are waiting ahead of this one for a free worker.
+function runsAhead(run) { return state.runs.filter((other) => other.status === 'queued' && other.created_at < run.created_at).length; }
 
 function renderRunSettings() {
   const group = findGroup(selectedGroupId);
@@ -280,7 +283,12 @@ function updateGroupSummary() {
   const run = latestRun(group.id);
   const status = $('run-status');
   status.className = 'pill';
-  if (run && run.status === 'running') {
+  if (run && run.status === 'queued') {
+    const ahead = runsAhead(run);
+    status.textContent = ahead ? `Queued · ${ahead} ahead` : 'Queued · next';
+    status.classList.add('running');
+  }
+  else if (run && run.status === 'running') {
     if (run.mode === 'workflow') status.textContent = `Workflow · ${run.workflow?.approved_results?.length || 0}/${Math.max(0, run.total - 1)} approved`;
     else if (run.continuous) status.textContent = `Ongoing · ${run.completed} turns`;
     else if (run.duration_seconds) {
@@ -293,18 +301,20 @@ function updateGroupSummary() {
   else if (run && run.status === 'blocked') { status.textContent = 'Needs input'; status.classList.add('failed'); }
   else if (run && run.status === 'complete') { status.textContent = run.completion_reason === 'time_limit' ? `Time finished · ${run.completed} turns` : 'Complete'; status.classList.add('ready'); }
   else if (run && run.status === 'stopped') status.textContent = `Stopped · ${run.completed} turns`;
+  else if (run && run.status === 'interrupted') { status.textContent = 'Interrupted'; status.classList.add('failed'); }
   else status.textContent = 'Ready';
-  $('run-error').hidden = !(run && ['failed', 'blocked'].includes(run.status));
-  $('run-error').textContent = run && ['failed', 'blocked'].includes(run.status) ? run.error : '';
+  const problem = run && ['failed', 'blocked', 'interrupted'].includes(run.status);
+  $('run-error').hidden = !problem;
+  $('run-error').textContent = problem ? run.error : '';
   const missingKeys = group.bot_ids.map(findBot).filter((bot) => bot && bot.auth_header && !state.key_status[bot.id]);
-  $('send-message').disabled = !!(run && run.status === 'running') || group.bot_ids.length < 2 || missingKeys.length > 0;
+  $('send-message').disabled = isActive(run) || group.bot_ids.length < 2 || missingKeys.length > 0;
   const workflow = group.mode === 'workflow';
   $('conversation-hint').textContent = group.bot_ids.length < 2 ? 'Add at least two bots to start.' : missingKeys.length ? `Set API keys in Bot setup for: ${missingKeys.map((bot) => bot.name).join(', ')}.` : workflow ? 'Workers follow their assignments in order. The master and current worker must both approve before handoff.' : 'Bots take turns until you stop. Each turn builds on the conversation so far.';
   $('send-message').textContent = workflow ? 'Start workflow' : 'Start conversation';
   $('stop-conversation').textContent = workflow ? 'Stop workflow' : 'Stop conversation';
-  $('stop-conversation').hidden = !(run && run.status === 'running');
+  $('stop-conversation').hidden = !isActive(run);
   $('stop-conversation').disabled = false;
-  for (const id of ['group-mode', 'group-master', 'group-quality', 'save-run-settings']) $(id).disabled = !!(run && run.status === 'running');
+  for (const id of ['group-mode', 'group-master', 'group-quality', 'save-run-settings']) $(id).disabled = isActive(run);
   renderWorkflowProgress(group, run);
 }
 
@@ -388,7 +398,11 @@ function renderMessages() {
     item.append(content); host.append(item);
   }
   const run = latestRun(group.id);
-  if (run && run.status === 'running') {
+  if (run && run.status === 'queued') {
+    const ahead = runsAhead(run);
+    host.append(node('div', 'waiting', `Waiting for a free slot${ahead ? ` · ${ahead} run${ahead === 1 ? '' : 's'} ahead` : ''}…`));
+  }
+  else if (run && run.status === 'running') {
     const speaker = state.bots.find((bot) => bot.name === run.current_bot);
     host.append(node('div', `waiting${speaker ? ` ${voice(speaker.id)}` : ''}`, run.waiting_reason || (run.current_bot ? `${run.current_bot} is replying…` : 'Starting the conversation…')));
   }
@@ -489,10 +503,11 @@ function applyRun({ run, sync_error: syncError }) {
   const index = state.runs.findIndex((item) => item.id === run.id);
   const previous = index >= 0 ? state.runs[index] : null;
   if (index >= 0) state.runs[index] = run; else state.runs.unshift(run);
-  if (previous?.status === 'running' && ['failed', 'blocked'].includes(run.status)) notice(run.error, true);
+  if (isActive(previous) && ['failed', 'blocked'].includes(run.status)) notice(run.error, true);
   else if (syncError) notice(syncError, true);
   renderGroupList();
-  if (run.group_id === selectedGroupId && page() === 'chats') { updateGroupSummary(); renderMessages(); renderGroupMembers(); }
+  const selected = latestRun(selectedGroupId);
+  if (page() === 'chats' && (run.group_id === selectedGroupId || selected?.status === 'queued')) { updateGroupSummary(); renderMessages(); renderGroupMembers(); }
 }
 
 function applyMessage({ group_id: groupId, message, message_count: count }) {

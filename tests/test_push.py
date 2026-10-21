@@ -134,12 +134,12 @@ class PushAPITests(unittest.TestCase):
         with patch.object(app, "run_group_conversation", side_effect=run):
             status, _ = self.request("POST", f"/api/groups/{self.group['id']}/send", {"text": "Begin", "continuous": False})
             self.assertEqual(status, 202)
-            events = self.read_events(stream, lambda event: event["event"] == "run" and event["data"]["run"]["status"] != "running")
+            events = self.read_events(stream, lambda event: event["event"] == "run" and event["data"]["run"]["status"] not in app.ACTIVE)
         messages = [event["data"] for event in events if event["event"] == "message"]
         self.assertEqual([m["message"]["text"] for m in messages], ["Begin", "Host reply", "Expert reply"])
         self.assertEqual([m["message_count"] for m in messages], [1, 2, 3])
         runs = [event["data"]["run"] for event in events if event["event"] == "run"]
-        self.assertEqual(runs[0]["status"], "running")
+        self.assertEqual([runs[0]["status"], runs[1]["status"]], ["queued", "running"])
         self.assertIn("Host", [run["current_bot"] for run in runs])
         self.assertEqual((runs[-1]["status"], runs[-1]["completed"]), ("complete", 2))
 

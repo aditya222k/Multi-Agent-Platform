@@ -539,12 +539,18 @@ def adapter_for(bot: dict) -> Adapter:
         raise UserError("Choose a supported API format.") from None
 
 
+# Shared by every run, so many groups talking at once cannot flood a provider with requests.
+MAX_MODEL_CALLS = 3
+MODEL_CALLS = threading.BoundedSemaphore(MAX_MODEL_CALLS)
+
+
 def call_bot(bot: dict, prompt: str, key: str, *, instruction_context: str = "") -> str | dict:
     validate_runnable(bot, key)
     system = bot_instructions(bot)
     if instruction_context:
         system += "\n\n" + instruction_context
-    return adapter_for(bot).call(bot, system, prompt, key, 4096 if instruction_context else 1600)
+    with MODEL_CALLS:
+        return adapter_for(bot).call(bot, system, prompt, key, 4096 if instruction_context else 1600)
 
 
 def run_group_round(

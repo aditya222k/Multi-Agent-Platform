@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 from urllib.parse import quote, urlencode, urlsplit
@@ -22,6 +23,7 @@ from core import UserError, _NoRedirect, _error_message, _tls_context
 PAGE_SIZE = 1000
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 RECENT_IMAGES = 24
+RECENT_RUNS = 30
 UPSERT = {"Prefer": "resolution=merge-duplicates,return=minimal"}
 IMAGE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
 
@@ -157,6 +159,9 @@ class LocalStore:
     def put_grants(self, grants: list[str]) -> None:
         self._save()
 
+    def put_run(self, run: dict) -> None:
+        self._save()
+
     def save_image(self, data: bytes, kind: str) -> str:
         self.images_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         name = f"{uuid.uuid4().hex}.{kind}"
@@ -241,7 +246,17 @@ class SupabaseStore:
             group["messages"] = by_group.get(group["id"], [])
             if group.get("last_workflow") is None:
                 group.pop("last_workflow", None)
-        return {"bots": bots, "groups": groups, "grants": self._read_grants()}
+        return {"bots": bots, "groups": groups, "grants": self._read_grants(), "runs": self._recent_runs()}
+
+    def _recent_runs(self) -> list[dict]:
+        try:
+            raw = self._request("GET", "/rest/v1/runs", params={"select": "data", "order": "updated_at.desc", "limit": RECENT_RUNS, "offset": 0})
+        except SupabaseError as error:
+            # Accounts created before run history existed can still sign in.
+            self.error = f"Run history is not saved yet: run supabase/schema.sql again in the Supabase SQL editor. ({error})"
+            return []
+        runs = [row["data"] for row in json.loads(raw) if isinstance(row, dict) and isinstance(row.get("data"), dict)]
+        return sorted(runs, key=lambda run: run.get("created_at") or 0)
 
     def _read_grants(self) -> list:
         try:
@@ -277,6 +292,11 @@ class SupabaseStore:
         if message.get("created_at"):
             row["created_at"] = message["created_at"]
         self._queue("POST", "/rest/v1/messages", params={"on_conflict": "owner_id,id"}, body=row, headers=UPSERT)
+
+    def put_run(self, run: dict) -> None:
+        row = {"owner_id": self.user_id, "id": run["id"], "group_id": run["group_id"], "data": run,
+               "updated_at": datetime.now(timezone.utc).isoformat()}
+        self._queue("POST", "/rest/v1/runs", params={"on_conflict": "owner_id,id"}, body=row, headers=UPSERT)
 
     def put_grants(self, grants: list[str]) -> None:
         # Grants are paths on this computer, so they stay local even when signed in.

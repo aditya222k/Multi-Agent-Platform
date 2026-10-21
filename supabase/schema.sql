@@ -43,9 +43,23 @@ create table if not exists public.messages (
 
 create index if not exists messages_group_order on public.messages (owner_id, group_id, seq);
 
+-- Recent conversation and workflow runs, so their outcome survives an app restart.
+create table if not exists public.runs (
+  owner_id uuid not null default auth.uid() references auth.users (id) on delete cascade,
+  id text not null,
+  group_id text not null,
+  data jsonb not null,
+  updated_at timestamptz not null default now(),
+  primary key (owner_id, id),
+  foreign key (owner_id, group_id) references public.groups (owner_id, id) on delete cascade
+);
+
+create index if not exists runs_recent on public.runs (owner_id, updated_at desc);
+
 alter table public.bots enable row level security;
 alter table public.groups enable row level security;
 alter table public.messages enable row level security;
+alter table public.runs enable row level security;
 
 drop policy if exists "Owners manage their bots" on public.bots;
 create policy "Owners manage their bots" on public.bots for all to authenticated
@@ -57,6 +71,10 @@ create policy "Owners manage their groups" on public.groups for all to authentic
 
 drop policy if exists "Owners manage their messages" on public.messages;
 create policy "Owners manage their messages" on public.messages for all to authenticated
+  using (owner_id = (select auth.uid())) with check (owner_id = (select auth.uid()));
+
+drop policy if exists "Owners manage their runs" on public.runs;
+create policy "Owners manage their runs" on public.runs for all to authenticated
   using (owner_id = (select auth.uid())) with check (owner_id = (select auth.uid()));
 
 -- Generated images: a private bucket with one folder per user (images/<user id>/<file>).
