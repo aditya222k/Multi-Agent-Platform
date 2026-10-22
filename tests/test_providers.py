@@ -39,6 +39,27 @@ class AdapterTests(unittest.TestCase):
                 self.assertIn(field, post.call_args.args[2])
                 self.assertEqual(post.call_args.args[1]["Authorization"], "Bearer key")
 
+    def test_a_reply_cut_off_while_thinking_is_retried_with_more_room(self):
+        cut_off = {
+            "chat_completions": ({"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}, {"choices": [{"message": {"content": "Answer"}, "finish_reason": "stop"}]}, "max_tokens"),
+            "responses": ({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "output": []},
+                          {"status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": "Answer"}]}]}, "max_output_tokens"),
+            "messages": ({"stop_reason": "max_tokens", "content": []}, {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Answer"}]}, "max_tokens"),
+        }
+        for api_format, (first, second, limit_field) in cut_off.items():
+            with self.subTest(api_format=api_format), patch.object(core, "_post_json", side_effect=[first, second]) as post:
+                self.assertEqual(core.call_bot(bot(api_format), "Hi", "key"), "Answer")
+                self.assertEqual([call.args[2][limit_field] for call in post.call_args_list], [1600, 6400])
+
+    def test_a_reply_cut_off_twice_explains_why_and_plain_empty_replies_are_not_retried(self):
+        cut_off = {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+        with patch.object(core, "_post_json", side_effect=[cut_off, cut_off]), self.assertRaisesRegex(core.UserError, "whole reply limit thinking"):
+            core.call_bot(bot("chat_completions"), "Hi", "key")
+        with patch.object(core, "_post_json", return_value={"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}) as post:
+            with self.assertRaisesRegex(core.UserError, "received no text"):
+                core.call_bot(bot("chat_completions"), "Hi", "key")
+        self.assertEqual(post.call_count, 1)
+
     def test_custom_settings_are_checked_by_the_custom_adapter(self):
         with self.assertRaisesRegex(core.UserError, "request template and response path"):
             core.validate_runnable(bot("custom"), "key")

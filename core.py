@@ -453,14 +453,24 @@ class Adapter:
     def reply_text(self, bot: dict, response: dict) -> object:
         raise NotImplementedError
 
+    def ran_out(self, response: dict) -> bool:
+        """Whether the provider stopped the reply because it hit the output limit."""
+        return False
+
     def call(self, bot: dict, system: str, prompt: str, key: str, output_limit: int, image: dict | None = None) -> str | dict:
-        # Text-only adapters never receive the image argument, so they can keep the simpler signature.
-        body = self.request(bot, system, prompt, key, output_limit) if image is None else self.request(bot, system, prompt, key, output_limit, image)
-        response = _post_json(bot["endpoint"], _auth_headers(bot, key), body, key)
-        try:
-            output = _as_text(self.reply_text(bot, response))
-        except (TypeError, ValueError):
-            raise UserError("The API response could not be read. Check the format and response path.") from None
+        # Reasoning models can spend the whole limit thinking and write nothing, so a cut-off reply gets one retry with more room.
+        for limit in (output_limit, min(MAX_OUTPUT_TOKENS, output_limit * 4)):
+            # Text-only adapters never receive the image argument, so they can keep the simpler signature.
+            body = self.request(bot, system, prompt, key, limit) if image is None else self.request(bot, system, prompt, key, limit, image)
+            response = _post_json(bot["endpoint"], _auth_headers(bot, key), body, key)
+            try:
+                output = _as_text(self.reply_text(bot, response))
+            except (TypeError, ValueError):
+                raise UserError("The API response could not be read. Check the format and response path.") from None
+            if output or not self.ran_out(response) or limit >= MAX_OUTPUT_TOKENS:
+                break
+        if not output and self.ran_out(response):
+            raise UserError(f"{bot['name']} used its whole reply limit thinking and wrote no answer. Try again, or use a model that thinks less.")
         if not output:
             raise UserError(f"{bot['name']} received no text from its API endpoint.")
         if len(output) > 100000:
@@ -478,6 +488,10 @@ class ChatCompletionsAdapter(Adapter):
     def reply_text(self, bot, response):
         return _at_path(response, "choices.0.message.content")
 
+    def ran_out(self, response):
+        choices = response.get("choices")
+        return isinstance(choices, list) and bool(choices) and isinstance(choices[0], dict) and choices[0].get("finish_reason") == "length"
+
 
 class ResponsesAdapter(Adapter):
     accepts_images = True
@@ -489,6 +503,10 @@ class ResponsesAdapter(Adapter):
     def reply_text(self, bot, response):
         return [part for item in response.get("output", []) if isinstance(item, dict) and item.get("type") == "message"
                 for part in item.get("content", []) if isinstance(part, dict) and part.get("type") == "output_text"]
+
+    def ran_out(self, response):
+        details = response.get("incomplete_details")
+        return response.get("status") == "incomplete" and isinstance(details, dict) and details.get("reason") == "max_output_tokens"
 
 
 class MessagesAdapter(Adapter):
@@ -502,6 +520,9 @@ class MessagesAdapter(Adapter):
 
     def reply_text(self, bot, response):
         return [part for part in response.get("content", []) if isinstance(part, dict) and part.get("type") == "text"]
+
+    def ran_out(self, response):
+        return response.get("stop_reason") == "max_tokens"
 
 
 class CustomAdapter(Adapter):
@@ -569,6 +590,9 @@ def adapter_for(bot: dict) -> Adapter:
     except KeyError:
         raise UserError("Choose a supported API format.") from None
 
+
+# The most room a cut-off reply is retried with; covers reasoning models that think at length.
+MAX_OUTPUT_TOKENS = 8192
 
 # Shared by every run, so many groups talking at once cannot flood a provider with requests.
 MAX_MODEL_CALLS = 3
