@@ -357,6 +357,8 @@ function updateGroupSummary() {
   $('send-message').textContent = workflow ? 'Start workflow' : 'Start conversation';
   $('stop-conversation').textContent = workflow ? 'Stop workflow' : 'Stop conversation';
   $('stop-conversation').hidden = !isActive(run);
+  $('clear-chat').disabled = isActive(run) || !group.message_count;
+  $('clear-chat').title = isActive(run) ? 'Stop the conversation before clearing the chat.' : '';
   $('stop-conversation').disabled = false;
   for (const id of ['group-mode', 'group-master', 'group-quality', 'save-run-settings']) $(id).disabled = isActive(run);
   renderWorkflowProgress(group, run);
@@ -578,6 +580,11 @@ function listen() {
   source.addEventListener('run', handle(applyRun));
   source.addEventListener('state', () => refreshState().catch((error) => notice(error.message, true)));
   source.addEventListener('resync', resync);
+  // Another tab cleared a chat: drop this page's copy so it shows the empty chat too.
+  source.addEventListener('cleared', handle(({ group_id: groupId }) => {
+    conversations.set(groupId, { messages: [], hasMore: false });
+    if (groupId === selectedGroupId && page() === 'chats') renderChat(false);
+  }));
   source.addEventListener('sync', handle((status) => { state.sync = status; renderSync(status); }));
   source.addEventListener('error', async () => {
     // The browser retries dropped connections itself; a refused stream usually means the session ended.
@@ -955,6 +962,20 @@ async function saveRunSettings() {
 }
 $('save-run-settings').addEventListener('click', saveRunSettings);
 $('group-mode').addEventListener('change', () => { $('workflow-settings').hidden = $('group-mode').value !== 'workflow'; saveRunSettings(); });
+
+$('clear-chat').addEventListener('click', async () => {
+  const group = findGroup(selectedGroupId);
+  if (!group) return;
+  const count = group.message_count;
+  if (!confirm(`Delete all ${count} message${count === 1 ? '' : 's'} in "${group.name}", including their images? Bots and settings stay. This cannot be undone.`)) return;
+  try {
+    const result = await api(`/api/groups/${group.id}/clear`, { confirm: true });
+    state = result;
+    conversations.set(group.id, { messages: [], hasMore: false });
+    renderGroupList(); renderChat(false);
+    notice(`Chat cleared. ${result.cleared} message${result.cleared === 1 ? '' : 's'} deleted.`);
+  } catch (error) { notice(error.message, true); }
+});
 
 $('stop-conversation').addEventListener('click', async () => {
   if (!selectedGroupId) return;

@@ -830,6 +830,9 @@ class Handler(BaseHTTPRequestHandler):
         if parts == [group_id, "send"]:
             self._send_group_message(group_id, body)
             return
+        if parts == [group_id, "clear"]:
+            self._clear_chat(group_id, body)
+            return
         if parts == [group_id, "stop"]:
             with STATE.lock:
                 STATE.group(group_id)
@@ -883,6 +886,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
             STATE.require_store().put_group(group)
         self._json(HTTPStatus.OK, STATE.public())
+
+    def _clear_chat(self, group_id: str, body: dict) -> None:
+        """Delete every message and image in one group. Bots, settings, and run history stay."""
+        if body.get("confirm") is not True:
+            raise UserError("Confirm that every message in this chat should be deleted.")
+        STATE.group(group_id)
+        store = STATE.require_store()
+        # Finding saved images can mean a network call, so it happens before taking the state lock.
+        images = store.group_images(group_id)
+        with STATE.lock:
+            group = STATE.group(group_id)
+            if any(run["group_id"] == group_id and run["status"] in ACTIVE for run in STATE.runs.values()):
+                raise UserError("Stop the conversation before clearing the chat.")
+            cleared = message_count(group)
+            images |= {message["image"] for message in group["messages"] if message.get("image")}
+            group["messages"], group["message_count"] = [], 0
+            group.pop("last_workflow", None)
+            store.put_group(group)
+            store.clear_messages(group_id, images)
+            STATE.events.publish("cleared", {"group_id": group_id})
+        self._json(HTTPStatus.OK, {**STATE.public(), "cleared": cleared})
 
     def _send_group_message(self, group_id: str, body: dict) -> None:
         message = body.get("text")

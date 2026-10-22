@@ -60,6 +60,10 @@ class FakeSupabase:
             if name not in self.objects:
                 raise storage.SupabaseError(404, "Object not found")
             return self.objects[name]
+        if parts.path.startswith("/storage/v1/object/images/") and method == "DELETE":
+            if self.objects.pop(parts.path.removeprefix("/storage/v1/object/images/"), None) is None:
+                raise storage.SupabaseError(404, "Object not found")
+            return b"{}"
         if parts.path.startswith("/storage/v1/object/images/"):
             self.objects[parts.path.removeprefix("/storage/v1/object/images/")] = data
             return b"{}"

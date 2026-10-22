@@ -105,6 +105,7 @@ h1,h2,h3{font-family:var(--display);font-weight:600;letter-spacing:-.01em}
 .check{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--muted)}
 .check input{margin:0}
 .ability-list{display:grid;gap:10px}
+.chat-header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .check.ability{align-items:flex-start;gap:10px;font-size:13px;color:var(--ink)}
 .check.ability input{margin-top:3px}
 .check.ability span{display:grid;gap:2px}

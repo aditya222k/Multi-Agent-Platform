@@ -277,6 +277,20 @@ class SQLiteStore:
     def delete_group(self, group_id: str) -> None:
         self._write([("delete from messages where group_id = ?", (group_id,)), ("delete from groups where id = ?", (group_id,))])
 
+    def group_images(self, group_id: str) -> set[str]:
+        return {name for row in self._read("select data from messages where group_id = ?", (group_id,))
+                if isinstance(name := json.loads(row[0]).get("image"), str) and name}
+
+    def clear_messages(self, group_id: str, images: set[str]) -> None:
+        """Delete every message in a group and the image files they showed."""
+        self._write([("delete from messages where group_id = ?", (group_id,))])
+        for name in images:
+            if Path(name).name == name and not name.startswith("."):  # A bare file name, never a path.
+                try:
+                    (self.images_dir / name).unlink()
+                except OSError:
+                    pass  # Already gone.
+
     def add_message(self, group_id: str, message: dict) -> None:
         self._write([("insert or ignore into messages (id, group_id, data) values (?, ?, ?)", self._message_row(group_id, message))])
 
@@ -615,6 +629,30 @@ class SupabaseStore:
         self.outbox.add("delete", "groups", group_id, b"")
         self._changed()
 
+    def group_images(self, group_id: str) -> set[str]:
+        """Image names in a group's saved messages. Network work, so callers run it outside the state lock."""
+        names: set[str] = set()
+        offset = 0
+        try:
+            while True:
+                rows = self._messages({"select": "image", "group_id": f"eq.{group_id}", "order": "seq.asc", "limit": PAGE_SIZE, "offset": offset})
+                names.update(row["image"] for row in rows if isinstance(row, dict) and row.get("image"))
+                if len(rows) < PAGE_SIZE:
+                    return names
+                offset += len(rows)
+        except SupabaseError:
+            return names  # Offline: images still in memory are cleared; older ones stay in storage.
+
+    def clear_messages(self, group_id: str, images: set[str]) -> None:
+        """Queue deleting a group's messages and images, after any of its changes still waiting to sync."""
+        # Queued in order, so a message still waiting to upload cannot reappear after the clear.
+        self.outbox.add("delete_where", "messages", group_id, json.dumps({"group_id": f"eq.{group_id}"}).encode("utf-8"))
+        for name in sorted(images):
+            self.outbox.add("delete_image", self._image_path(name), name, b"")
+            with self._recent_lock:
+                self._recent.pop(name, None)
+        self._changed()
+
     def add_message(self, group_id: str, message: dict) -> None:
         # Every row carries the same columns, so a batch can go in one request.
         self._upsert("messages", {"owner_id": self.user_id, "group_id": group_id, "id": message["id"], "sender": message["sender"],
@@ -738,6 +776,14 @@ class SupabaseStore:
             self._request("POST", f"/rest/v1/{first['target']}", params={"on_conflict": conflict}, body=list(rows.values()), headers=UPSERT)
         elif first["kind"] == "delete":
             self._request("DELETE", f"/rest/v1/{first['target']}", params={ROW_KEYS.get(first["target"], "id"): f"eq.{first['key']}"})
+        elif first["kind"] == "delete_where":
+            self._request("DELETE", f"/rest/v1/{first['target']}", params=json.loads(first["payload"]))
+        elif first["kind"] == "delete_image":
+            try:
+                self._request("DELETE", first["target"])
+            except SupabaseError as error:
+                if error.status not in {400, 404}:
+                    raise  # An image that is already gone needs no retry.
         else:
             self._request("POST", first["target"], data=bytes(first["payload"]), headers={"Content-Type": first["content_type"], "x-upsert": "true"})
 
