@@ -61,6 +61,10 @@
               <label class="field wide">Role<textarea id="bot-role" rows="3" maxlength="5000" placeholder="Who is this bot? What perspective does it bring?"></textarea></label>
               <label class="field wide">Assignment<span class="field-help">Leave empty for general help. Otherwise, replies focus on this assignment. Save bot to apply changes.</span><textarea id="bot-assignment" rows="3" maxlength="5000" placeholder="What should this bot do when it speaks in a group chat?"></textarea></label>
             </div></div>
+            <div class="form-section"><div class="section-head"><h3>Abilities</h3><span class="section-note">Save bot to apply changes</span></div><div class="ability-list">
+              <label class="check ability"><input id="bot-vision" type="checkbox"><span><strong>Can see images</strong><small>Gets the latest picture in the chat with each turn. Needs a model that accepts images, such as Gemma 4.</small></span></label>
+              <label class="check ability"><input id="bot-can-finish" type="checkbox"><span><strong>Can finish the run</strong><small>Ends the conversation by replying with [[DONE]] when the result meets the request.</small></span></label>
+            </div></div>
             <div class="form-section"><div class="section-head"><h3>Model connection</h3><span class="section-note">One connection per bot</span></div><div class="field-grid">
               <label class="field wide">API endpoint<input id="bot-endpoint" type="url" spellcheck="false" placeholder="https://your-provider.example/v1/chat/completions"></label>
               <label class="field">Model ID<input id="bot-model" spellcheck="false" placeholder="Your model's ID"></label>

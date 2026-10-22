@@ -52,6 +52,15 @@ If port 8765 is busy, run `python3 app.py --port 8766`.
 
 Bots using the **Image generation** format turn the latest message from another participant into a picture. The image is saved under `.local/images/` and shown in the chat. Image bots join group conversations but not task workflows.
 
+### Judge bots
+
+Two abilities in **Bot setup → Abilities** let one bot review the pictures and end the run:
+
+- **Can see images:** the newest picture in the chat is sent with the bot's turn. It needs a model that accepts images (for example `google.gemma-4-31B-it` on Dartmouth Chat) and the Chat completions, Responses, or Messages format. Pictures are shrunk to a 512 px JPEG with Pillow (`python3 -m pip install Pillow`); without Pillow, pictures up to 4 MB are sent as they are.
+- **Can finish the run:** when this bot ends a reply with `[[DONE]]`, the run stops as **Approved** and its message gets a badge. There is no round limit: until it approves, the run continues until you press Stop (or a timer ends it), and each round with an image bot makes a new picture.
+
+A typical setup in one group: a describer, an image bot, then a judge with both abilities.
+
 ### Role vs. assignment
 
 - The **assignment** is the bot's task. Its replies focus on that work. If the assignment is empty, the bot acts as a general assistant.

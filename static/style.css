@@ -104,6 +104,12 @@ h1,h2,h3{font-family:var(--display);font-weight:600;letter-spacing:-.01em}
 .key-options{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
 .check{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--muted)}
 .check input{margin:0}
+.ability-list{display:grid;gap:10px}
+.check.ability{align-items:flex-start;gap:10px;font-size:13px;color:var(--ink)}
+.check.ability input{margin-top:3px}
+.check.ability span{display:grid;gap:2px}
+.check.ability small{color:var(--muted);font-size:12px}
+.approved-badge{font-size:11px;font-weight:600;color:var(--ok);background:var(--ok-soft);border-radius:999px;padding:1px 8px}
 .danger-link{color:var(--danger)}
 .vault-card{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 18px;margin-bottom:18px}
 .vault-text strong{font-size:13px}

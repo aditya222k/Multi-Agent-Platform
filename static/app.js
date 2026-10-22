@@ -137,6 +137,8 @@ function formDraft() {
     headers_text: $('bot-headers').value,
     request_template: $('bot-template').value,
     response_path: $('bot-response-path').value,
+    vision: $('bot-vision').checked,
+    can_finish: $('bot-can-finish').checked,
   };
 }
 
@@ -147,6 +149,7 @@ function botDraft(bot) {
     auth_header: bot.auth_header, auth_prefix: bot.auth_prefix,
     headers_text: JSON.stringify(bot.extra_headers, null, 2),
     request_template: bot.request_template, response_path: bot.response_path,
+    vision: !!bot.vision, can_finish: !!bot.can_finish,
   };
 }
 
@@ -180,6 +183,8 @@ function renderBotEditor() {
   $('bot-headers').value = draft.headers_text;
   $('bot-template').value = draft.request_template;
   $('bot-response-path').value = draft.response_path;
+  $('bot-vision').checked = !!draft.vision;
+  $('bot-can-finish').checked = !!draft.can_finish;
   $('bot-key').value = '';
   $('custom-fields').hidden = draft.api_format !== 'custom';
   const hasKey = !!state.key_status[bot.id];
@@ -260,6 +265,10 @@ function selectGroup(id) {
   navigate('chats', id);
 }
 
+function imageCount(run) {
+  return run.images ? ` · ${run.images} image${run.images === 1 ? '' : 's'}` : '';
+}
+
 function latestRun(groupId) { return state.runs.find((run) => run.group_id === groupId); }
 function isActive(run) { return !!run && ['queued', 'running'].includes(run.status); }
 // How many runs, in any group, are waiting ahead of this one for a free worker.
@@ -321,7 +330,7 @@ function updateGroupSummary() {
   }
   else if (run && run.status === 'running') {
     if (run.mode === 'workflow') status.textContent = `Workflow · ${run.workflow?.approved_results?.length || 0}/${Math.max(0, run.total - 1)} approved`;
-    else if (run.continuous) status.textContent = `Ongoing · ${run.completed} turns`;
+    else if (run.continuous) status.textContent = `Ongoing · ${run.completed} turns${imageCount(run)}`;
     else if (run.duration_seconds) {
       const seconds = Math.max(0, Math.ceil(run.ends_at - Date.now() / 1000));
       status.textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')} left · ${run.completed} turns`;
@@ -330,7 +339,11 @@ function updateGroupSummary() {
   }
   else if (run && run.status === 'failed') { status.textContent = 'Needs attention'; status.classList.add('failed'); }
   else if (run && run.status === 'blocked') { status.textContent = 'Needs input'; status.classList.add('failed'); }
-  else if (run && run.status === 'complete') { status.textContent = run.completion_reason === 'time_limit' ? `Time finished · ${run.completed} turns` : 'Complete'; status.classList.add('ready'); }
+  else if (run && run.status === 'complete') {
+    status.textContent = run.completion_reason === 'approved' ? `Approved by ${run.approved_by || 'a bot'}${imageCount(run)}`
+      : run.completion_reason === 'time_limit' ? `Time finished · ${run.completed} turns` : 'Complete';
+    status.classList.add('ready');
+  }
   else if (run && run.status === 'stopped') status.textContent = `Stopped · ${run.completed} turns`;
   else if (run && run.status === 'interrupted') { status.textContent = 'Interrupted'; status.classList.add('failed'); }
   else status.textContent = 'Ready';
@@ -405,6 +418,8 @@ function renderMessages() {
     host.append(earlier);
   }
   if (!chat.messages.length) host.append(node('div', 'conversation-empty', 'This group is ready. Send a message to begin.'));
+  // A judge's approval is recorded on its run, so recent runs say which messages to mark.
+  const approvedIds = new Set(state.runs.map((run) => run.approved_message_id).filter(Boolean));
   for (const message of chat.messages) {
     const isUser = !message.bot_id;
     const item = node('article', `message${isUser ? ' user' : ` ${voice(message.bot_id)}`}`);
@@ -412,6 +427,7 @@ function renderMessages() {
     const content = node('div', 'message-content');
     const head = node('div', 'message-head');
     head.append(node('strong', null, message.sender));
+    if (approvedIds.has(message.id)) head.append(node('span', 'approved-badge', '✅ Approved'));
     if (message.created_at) {
       const time = new Date(message.created_at);
       if (!Number.isNaN(time.getTime())) head.append(node('span', null, time.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })));

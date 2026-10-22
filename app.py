@@ -926,7 +926,7 @@ class Handler(BaseHTTPRequestHandler):
             history = copy.deepcopy(group["messages"])
             group_title = group["name"]
             run_id = uuid.uuid4().hex
-            STATE.runs[run_id] = {"id": run_id, "group_id": group_id, "status": "queued", "created_at": time.time(), "completed": 0, "total": len(bots), "error": "", "continuous": continuous, "duration_seconds": duration, "ends_at": time.time() + duration if duration else None, "current_bot": "", "completion_reason": ""}
+            STATE.runs[run_id] = {"id": run_id, "group_id": group_id, "status": "queued", "created_at": time.time(), "completed": 0, "images": 0, "total": len(bots), "error": "", "continuous": continuous, "duration_seconds": duration, "ends_at": time.time() + duration if duration else None, "current_bot": "", "completion_reason": ""}
             STATE.runs[run_id].update(mode=mode, master_id=master_id, quality_criteria=group.get("quality_criteria", ""))
             if mode == "workflow" and group.pop("last_workflow", None) is not None:
                 store.put_group(group)
@@ -989,6 +989,13 @@ def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[d
         run = STATE.runs.get(run_id)
         return bool(run) and run["status"] == "running" and not stop_event.is_set() and (run["ends_at"] is None or time.time() < run["ends_at"])
 
+    def load_image(name: str) -> bytes:
+        # Bots that see images get saved pictures from local files, Supabase, or the outbox.
+        store = STATE.store
+        if store is None:
+            raise OSError("signed out")
+        return store.load_image(name)
+
     def on_message(message: dict) -> None:
         complete = {"id": uuid.uuid4().hex, "sender": message["sender"], "bot_id": message["bot_id"], "text": message["text"], "created_at": now(), "files": []}
         if message.get("image"):
@@ -1001,7 +1008,13 @@ def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[d
         with STATE.lock:
             if not accepting():
                 return
-            STATE.runs[run_id]["completed"] += 1
+            run = STATE.runs[run_id]
+            run["completed"] += 1
+            if complete.get("image"):
+                run["images"] = run.get("images", 0) + 1
+            if message.get("approved"):
+                # Recorded on the run, so the chat can mark the approving message without a schema change.
+                run.update(approved_message_id=complete["id"], approved_by=message["sender"])
             STATE.add_message(STATE.group(group_id), complete)
             STATE.publish_run(run_id, persist=True)
 
@@ -1013,7 +1026,8 @@ def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[d
                                        quality_criteria=quality_criteria, stop_event=stop_event,
                                        on_progress=on_progress, on_wait=on_wait)
         else:
-            reason = run_group_conversation(group_title, bots, history, files, keys, on_message, duration_seconds=duration, continuous=continuous, stop_event=stop_event, on_turn=on_turn, on_wait=on_wait)
+            reason = run_group_conversation(group_title, bots, history, files, keys, on_message, duration_seconds=duration, continuous=continuous,
+                                            stop_event=stop_event, on_turn=on_turn, on_wait=on_wait, load_image=load_image)
         with STATE.lock:
             if run_id in STATE.runs and STATE.runs[run_id]["status"] == "running":
                 STATE.runs[run_id].update(status="stopped" if reason == "stopped" else "complete", completion_reason=reason, current_bot="")

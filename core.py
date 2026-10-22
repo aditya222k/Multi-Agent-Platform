@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import io
 import json
 import os
 import queue
@@ -15,9 +17,15 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urljoin, urlsplit
+
+try:
+    from PIL import Image as PILImage
+except ImportError:  # Optional: without Pillow, small images are sent as they are.
+    PILImage = None
 
 
 DESKTOP = Path.home() / "Desktop"
@@ -53,6 +61,8 @@ def blank_bot(bot_id: str) -> dict:
         "extra_headers": {},
         "request_template": "",
         "response_path": "",
+        "vision": False,
+        "can_finish": False,
     }
 
 
@@ -82,6 +92,13 @@ def validate_bot(raw: object, bot_id: str) -> dict:
         raise UserError("A bot name is required and one of the fields is too long.")
     if bot["api_format"] not in ADAPTERS:
         raise UserError("Choose a supported API format.")
+    for flag in ("vision", "can_finish"):
+        value = raw.get(flag, False)
+        if not isinstance(value, bool):
+            raise UserError(f"Invalid {flag.replace('_', ' ')} setting.")
+        bot[flag] = value
+    if bot["vision"] and not ADAPTERS[bot["api_format"]].accepts_images:
+        raise UserError("Only Chat completions, Responses, or Messages bots can see images.")
     if bot["endpoint"]:
         validate_endpoint(bot["endpoint"])
     if bot["auth_header"] and not HEADER_NAME.fullmatch(bot["auth_header"]):
@@ -425,18 +442,21 @@ class Adapter:
     sends_history = True  # False: the prompt is only the latest message from another participant.
     joins_ongoing_talk = True  # False: skip the "keep the conversation going" instruction.
     joins_workflows = True  # False: cannot return the JSON decisions task workflows need.
+    accepts_images = False  # True: a bot that can see images gets the latest picture with its prompt.
 
     def check(self, bot: dict) -> None:
         """Raise UserError if this format's own settings are incomplete."""
 
-    def request(self, bot: dict, system: str, prompt: str, key: str, output_limit: int) -> dict:
+    def request(self, bot: dict, system: str, prompt: str, key: str, output_limit: int, image: dict | None = None) -> dict:
         raise NotImplementedError
 
     def reply_text(self, bot: dict, response: dict) -> object:
         raise NotImplementedError
 
-    def call(self, bot: dict, system: str, prompt: str, key: str, output_limit: int) -> str | dict:
-        response = _post_json(bot["endpoint"], _auth_headers(bot, key), self.request(bot, system, prompt, key, output_limit), key)
+    def call(self, bot: dict, system: str, prompt: str, key: str, output_limit: int, image: dict | None = None) -> str | dict:
+        # Text-only adapters never receive the image argument, so they can keep the simpler signature.
+        body = self.request(bot, system, prompt, key, output_limit) if image is None else self.request(bot, system, prompt, key, output_limit, image)
+        response = _post_json(bot["endpoint"], _auth_headers(bot, key), body, key)
         try:
             output = _as_text(self.reply_text(bot, response))
         except (TypeError, ValueError):
@@ -449,16 +469,22 @@ class Adapter:
 
 
 class ChatCompletionsAdapter(Adapter):
-    def request(self, bot, system, prompt, key, output_limit):
-        return {"model": bot["model"], "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}], "max_tokens": output_limit}
+    accepts_images = True
+
+    def request(self, bot, system, prompt, key, output_limit, image=None):
+        content = prompt if image is None else [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": _data_url(image)}}]
+        return {"model": bot["model"], "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}], "max_tokens": output_limit}
 
     def reply_text(self, bot, response):
         return _at_path(response, "choices.0.message.content")
 
 
 class ResponsesAdapter(Adapter):
-    def request(self, bot, system, prompt, key, output_limit):
-        return {"model": bot["model"], "instructions": system, "input": prompt, "max_output_tokens": output_limit, "store": False}
+    accepts_images = True
+
+    def request(self, bot, system, prompt, key, output_limit, image=None):
+        given = prompt if image is None else [{"role": "user", "content": [{"type": "input_text", "text": prompt}, {"type": "input_image", "image_url": _data_url(image)}]}]
+        return {"model": bot["model"], "instructions": system, "input": given, "max_output_tokens": output_limit, "store": False}
 
     def reply_text(self, bot, response):
         return [part for item in response.get("output", []) if isinstance(item, dict) and item.get("type") == "message"
@@ -466,8 +492,13 @@ class ResponsesAdapter(Adapter):
 
 
 class MessagesAdapter(Adapter):
-    def request(self, bot, system, prompt, key, output_limit):
-        return {"model": bot["model"], "system": system, "messages": [{"role": "user", "content": prompt}], "max_tokens": output_limit}
+    accepts_images = True
+
+    def request(self, bot, system, prompt, key, output_limit, image=None):
+        content = prompt if image is None else [
+            {"type": "image", "source": {"type": "base64", "media_type": image["media_type"], "data": base64.b64encode(image["data"]).decode("ascii")}},
+            {"type": "text", "text": prompt}]
+        return {"model": bot["model"], "system": system, "messages": [{"role": "user", "content": content}], "max_tokens": output_limit}
 
     def reply_text(self, bot, response):
         return [part for part in response.get("content", []) if isinstance(part, dict) and part.get("type") == "text"]
@@ -480,7 +511,7 @@ class CustomAdapter(Adapter):
         if not any(token in bot["request_template"] for token in ("{{system}}", "{{prompt}}")):
             raise UserError("The custom request template must include {{system}} or {{prompt}} so the bot receives its instructions.")
 
-    def request(self, bot, system, prompt, key, output_limit):
+    def request(self, bot, system, prompt, key, output_limit, image=None):
         # Templates without a system field still need the bot's task instructions.
         custom_prompt = prompt if "{{system}}" in bot["request_template"] else system + "\n\n" + prompt
         return _replace_template(json.loads(bot["request_template"]), {"model": bot["model"], "system": system, "role": bot["role"], "assignment": bot["assignment"], "prompt": custom_prompt, "api_key": key})
@@ -494,7 +525,7 @@ class ImageGenerationAdapter(Adapter):
     joins_ongoing_talk = False
     joins_workflows = False
 
-    def call(self, bot, system, prompt, key, output_limit):
+    def call(self, bot, system, prompt, key, output_limit, image=None):
         # DALL-E 2 rejects prompts over 1,000 characters; newer models accept more.
         prompt = prompt.strip()[:1000 if bot["model"] == "dall-e-2" else 4000]
         headers = _auth_headers(bot, key)
@@ -544,13 +575,99 @@ MAX_MODEL_CALLS = 3
 MODEL_CALLS = threading.BoundedSemaphore(MAX_MODEL_CALLS)
 
 
-def call_bot(bot: dict, prompt: str, key: str, *, instruction_context: str = "") -> str | dict:
+def call_bot(bot: dict, prompt: str, key: str, *, instruction_context: str = "", image: dict | None = None) -> str | dict:
     validate_runnable(bot, key)
+    adapter = adapter_for(bot)
+    if image is not None and not adapter.accepts_images:
+        raise UserError(f"{bot['name']} uses an API format that cannot receive images.")
     system = bot_instructions(bot)
     if instruction_context:
         system += "\n\n" + instruction_context
     with MODEL_CALLS:
-        return adapter_for(bot).call(bot, system, prompt, key, 4096 if instruction_context else 1600)
+        return adapter.call(bot, system, prompt, key, 4096 if instruction_context else 1600, image)
+
+
+# Pictures for bots that can see them: shrunk once, then reused for every later turn.
+VISION_SIZE = 512
+MAX_UNSHRUNK_IMAGE_BYTES = 4 * 1024 * 1024
+MEDIA_TYPES = {"png": "image/png", "jpg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
+DONE_MARK = "[[DONE]]"
+_prepared: OrderedDict[str, dict] = OrderedDict()
+_prepared_lock = threading.Lock()
+
+
+def _data_url(image: dict) -> str:
+    return f"data:{image['media_type']};base64,{base64.b64encode(image['data']).decode('ascii')}"
+
+
+def prepare_image(data: bytes) -> dict:
+    """A small JPEG for a vision model: within 512 px, usually under 50 KB. Cached by content."""
+    digest = hashlib.sha256(data).hexdigest()
+    with _prepared_lock:
+        if digest in _prepared:
+            _prepared.move_to_end(digest)
+            return _prepared[digest]
+    if PILImage is not None:
+        try:
+            with PILImage.open(io.BytesIO(data)) as picture:
+                picture.thumbnail((VISION_SIZE, VISION_SIZE))
+                output = io.BytesIO()
+                picture.convert("RGB").save(output, "JPEG", quality=70, optimize=True)
+        except (OSError, ValueError):
+            raise UserError("The latest image could not be read for the bots that see images.") from None
+        prepared = {"data": output.getvalue(), "media_type": "image/jpeg"}
+    else:
+        kind = image_type(data)
+        if not kind or len(data) > MAX_UNSHRUNK_IMAGE_BYTES:
+            raise UserError("Install Pillow (python3 -m pip install Pillow) so images can be shrunk for the bots that see them.")
+        prepared = {"data": data, "media_type": MEDIA_TYPES[kind]}
+    with _prepared_lock:
+        _prepared[digest] = prepared
+        while len(_prepared) > 32:
+            _prepared.popitem(last=False)
+    return prepared
+
+
+def latest_image(messages: list[dict], load_image: Callable[[str], bytes] | None) -> tuple[dict | None, dict | None]:
+    """The newest picture in the conversation, prepared for a vision model, and the message that posted it."""
+    for message in reversed(messages):
+        image = message.get("image")
+        if not image:
+            continue
+        if isinstance(image, (bytes, bytearray)):
+            data = bytes(image)  # Made in this run and not saved yet.
+        elif load_image is None:
+            raise UserError("The latest image is not available to the bots that see images.")
+        else:
+            try:
+                data = load_image(image)
+            except OSError:
+                raise UserError("The latest image could not be loaded for the bots that see images.") from None
+        return prepare_image(data), message
+    return None, None
+
+
+def judge_prompt(prompt: str, bot: dict, shown: dict | None) -> str:
+    """Tell a bot what picture it is looking at and, when it may, how to end the conversation."""
+    if bot.get("vision"):
+        if shown:
+            prompt += (f"\n\nThe attached image is the latest picture in this chat, posted by {json.dumps(shown.get('sender', ''))}. "
+                       f"It was made from this description:\n{shown.get('text', '')[:2000]}")
+        else:
+            prompt += "\n\nNo picture has been posted in this chat yet."
+    if bot.get("can_finish"):
+        prompt += (f"\nYou decide when this conversation is finished. If the result fully meets the request, end your reply with {DONE_MARK} on its own line. "
+                   f"Otherwise give the one to three most important fixes and do not write {DONE_MARK}.")
+        if bot.get("vision") and not shown:
+            prompt += f" Do not write {DONE_MARK} before a picture exists."
+    return prompt
+
+
+def finished(bot: dict, output: str | dict) -> tuple[str | dict, bool]:
+    """Whether a bot allowed to finish the run approved it, with the marker removed from its reply."""
+    if bot.get("can_finish") and isinstance(output, str) and DONE_MARK in output:
+        return output.replace(DONE_MARK, "").strip() or "Approved.", True
+    return output, False
 
 
 def run_group_round(
@@ -590,8 +707,9 @@ def run_group_conversation(
     on_wait: Callable[[str], None] = lambda message: None,
     model_call: Callable[[dict, str, str], str] = call_bot,
     clock: Callable[[], float] = time.monotonic,
+    load_image: Callable[[str], bytes] | None = None,
 ) -> str:
-    """Run continuous, timed, or single-round turns until stopped/completed."""
+    """Run continuous, timed, or single-round turns until stopped, approved, or completed."""
     if not bots:
         raise UserError("Add at least one bot to this group chat.")
     stop_event = stop_event if stop_event is not None else threading.Event()
@@ -609,12 +727,16 @@ def run_group_conversation(
         prompt = turn_prompt(group_name, conversation, files, bot, next_bot)
         if looping and adapter_for(bot).joins_ongoing_talk:
             prompt += "\nThis is an ongoing conversation between the bots. Respond to the latest participant's contribution and build on what they said within your assignment. Give one useful reply or relevant follow-up question, then let the next participant speak. Do not repeat earlier material or ask the human to send 'continue'."
+        image, shown = latest_image(conversation, load_image) if bot.get("vision") else (None, None)
+        prompt = judge_prompt(prompt, bot, shown)
         on_turn(bot)
         result: queue.Queue = queue.Queue(maxsize=1)
+        # Only a bot that sees images gets the extra argument, so plain model calls keep their shape.
+        extra = {"image": image} if image is not None else {}
 
-        def invoke(current_bot=bot, current_prompt=prompt, result_queue=result):
+        def invoke(current_bot=bot, current_prompt=prompt, result_queue=result, current_extra=extra):
             try:
-                result_queue.put((True, model_call(current_bot, current_prompt, keys.get(current_bot["id"], ""))))
+                result_queue.put((True, model_call(current_bot, current_prompt, keys.get(current_bot["id"], ""), **current_extra)))
             except Exception as error:
                 result_queue.put((False, error))
 
@@ -651,8 +773,13 @@ def run_group_conversation(
             break
         if retry:
             continue
+        output, approved = finished(bot, output)
         message = bot_message(bot, output)
+        if approved:
+            message["approved"] = True
         on_message(message)
         conversation.append(message)
+        if approved:
+            return "approved"
         turn += 1
     return "one_round"
