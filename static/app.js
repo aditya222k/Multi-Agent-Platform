@@ -69,9 +69,16 @@ function notice(message, error = false) {
   const box = $('notice');
   box.textContent = message;
   box.classList.toggle('error', error);
-  box.hidden = false;
+  box.classList.add('show');
   clearTimeout(notice.timer);
-  notice.timer = setTimeout(() => { box.hidden = true; }, 5500);
+  notice.timer = setTimeout(() => box.classList.remove('show'), 5500);
+}
+
+// Replays the fade-in on a panel whose content just changed.
+function enter(el) {
+  el.classList.remove('enter');
+  void el.offsetWidth;
+  el.classList.add('enter');
 }
 
 function node(tag, className, text) {
@@ -87,6 +94,7 @@ function navigate(destination, groupId = selectedGroupId, push = true) {
   const params = new URLSearchParams({ token });
   if (destination === 'chats' && groupId) params.set('group', groupId);
   if (push) history.pushState({}, '', `/${destination}?${params}`);
+  if ($(`${destination}-page`).hidden) enter($(`${destination}-page`));
   $('bots-page').hidden = destination !== 'bots';
   $('chats-page').hidden = destination !== 'chats';
   $('nav-bots').classList.toggle('active', destination === 'bots');
@@ -109,9 +117,10 @@ function voice(id) {
 function findGroup(id) { return state.groups.find((group) => group.id === id); }
 
 function renderBotList() {
-  const host = $('bot-list'); host.replaceChildren();
+  const host = $('bot-list');
   $('bot-count').textContent = String(state.bots.length);
-  if (!state.bots.length) host.append(node('div', 'empty-list', 'No bots yet.'));
+  const rows = [];
+  if (!state.bots.length) rows.push(keyed(node('div', 'empty-list', 'No bots yet.'), 'empty'));
   for (const bot of state.bots) {
     const button = node('button', `rail-item${bot.id === selectedBotId ? ' active' : ''}`);
     button.type = 'button';
@@ -120,8 +129,9 @@ function renderBotList() {
     copy.append(node('strong', null, bot.name), node('small', null, bot.role || 'Role not set'));
     button.append(avatar, copy);
     button.addEventListener('click', () => selectBot(bot.id));
-    host.append(button);
+    rows.push(keyed(button, bot.id));
   }
+  patchList(host, rows);
 }
 
 function formDraft() {
@@ -163,6 +173,7 @@ function selectBot(id) {
   selectedBotId = id;
   renderBotList();
   renderBotEditor();
+  enter($('bot-editor'));
 }
 
 function renderBotEditor() {
@@ -172,6 +183,8 @@ function renderBotEditor() {
   if (!bot) return;
   const draft = drafts.get(bot.id) || botDraft(bot);
   $('editor-title').textContent = draft.name || 'New bot';
+  $('editor-avatar').className = `editor-avatar ${voice(bot.id)}`;
+  $('editor-avatar').textContent = (draft.name || '?').slice(0, 1).toUpperCase();
   $('bot-name').value = draft.name;
   $('bot-role').value = draft.role;
   $('bot-assignment').value = draft.assignment;
@@ -207,6 +220,31 @@ function renderBotEditor() {
   renderVault();
 }
 
+const smoothMotion = () => !matchMedia('(prefers-reduced-motion: reduce)').matches;
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Updates a list in place from freshly built rows keyed by data-key: unchanged rows stay put (keeping
+// hover, focus and running transitions), and rows that move or appear glide into place.
+function patchList(host, rows) {
+  const before = new Map([...host.children].map((el) => [el.dataset.key, el]));
+  const tops = new Map([...before].map(([key, el]) => [key, el.getBoundingClientRect().top]));
+  const next = rows.map((row) => {
+    const previous = before.get(row.dataset.key);
+    return previous && previous.outerHTML === row.outerHTML ? previous : row;
+  });
+  next.forEach((el, index) => { if (host.children[index] !== el) host.insertBefore(el, host.children[index] || null); });
+  while (host.children.length > next.length) host.lastElementChild.remove();
+  if (!smoothMotion() || !before.size) return;
+  const easing = 'cubic-bezier(.2,.8,.2,1)';
+  for (const el of next) {
+    if (!tops.has(el.dataset.key)) { el.animate([{ opacity: 0, transform: 'translateY(4px)' }, { opacity: 1, transform: 'none' }], { duration: 220, easing }); continue; }
+    const delta = tops.get(el.dataset.key) - el.getBoundingClientRect().top;
+    if (delta) el.animate([{ transform: `translateY(${delta}px)` }, { transform: 'none' }], { duration: 260, easing });
+  }
+}
+
+function keyed(el, key) { el.dataset.key = key; return el; }
+
 function switchRow(title, subtitle, checked, onToggle) {
   const row = node('div', 'toggle-row');
   const copy = node('div', 'toggle-copy');
@@ -216,7 +254,8 @@ function switchRow(title, subtitle, checked, onToggle) {
   toggle.type = 'button'; toggle.setAttribute('role', 'switch');
   toggle.setAttribute('aria-label', `${title} ${checked ? 'on' : 'off'}`);
   toggle.setAttribute('aria-checked', String(checked));
-  toggle.addEventListener('click', onToggle);
+  // Flips at once so the switch slides on click rather than after the server answers.
+  toggle.addEventListener('click', () => { toggle.setAttribute('aria-checked', String(!checked)); onToggle(); });
   row.append(copy, toggle);
   return row;
 }
@@ -224,46 +263,57 @@ function switchRow(title, subtitle, checked, onToggle) {
 async function setMembership(groupId, botId, enabled) {
   try {
     stashDraft();
-    state = await api(`/api/groups/${groupId}/members`, { bot_id: botId, enabled });
+    // Redraws after the switch has finished sliding, so the new rows don't cut it short.
+    [state] = await Promise.all([api(`/api/groups/${groupId}/members`, { bot_id: botId, enabled }), wait(180)]);
     renderBotList(); renderBotGroups(); renderGroupList(); renderGroupMembers(); renderRunSettings(); updateGroupSummary();
-  } catch (error) { notice(error.message, true); }
+  } catch (error) { renderBotGroups(); renderGroupMembers(); notice(error.message, true); }
 }
 
 function renderBotGroups() {
-  const host = $('bot-groups'); host.replaceChildren();
-  if (!selectedBotId) return;
+  const host = $('bot-groups');
+  if (!selectedBotId) { host.replaceChildren(); return; }
   if (!state.groups.length) {
-    host.append(node('div', 'empty-list', 'No groups yet. Create one on the Group chats page.'));
+    patchList(host, [keyed(node('div', 'empty-list', 'No groups yet. Create one on the Group chats page.'), 'empty')]);
     return;
   }
-  for (const group of state.groups) {
-    const joined = group.bot_ids.includes(selectedBotId);
-    host.append(switchRow(group.name, `${group.bot_ids.length} bot${group.bot_ids.length === 1 ? '' : 's'}`, joined, () => setMembership(group.id, selectedBotId, !joined)));
-  }
+  const botId = selectedBotId;
+  patchList(host, state.groups.map((group) => {
+    const joined = group.bot_ids.includes(botId);
+    return keyed(switchRow(group.name, `${group.bot_ids.length} bot${group.bot_ids.length === 1 ? '' : 's'}`, joined, () => setMembership(group.id, botId, !joined)), `${botId}:${group.id}`);
+  }));
 }
 
 function renderGroupList() {
-  const host = $('group-list'); host.replaceChildren();
+  const host = $('group-list');
   $('group-count').textContent = String(state.groups.length);
-  if (!state.groups.length) host.append(node('div', 'empty-list', 'No group chats yet.'));
+  const rows = [];
+  if (!state.groups.length) rows.push(keyed(node('div', 'empty-list', 'No group chats yet.'), 'empty'));
   for (const group of state.groups) {
     const button = node('button', `rail-item${group.id === selectedGroupId ? ' active' : ''}`);
     button.type = 'button';
-    const avatar = node('span', 'rail-avatar', group.name.slice(0, 1).toUpperCase());
+    // A group shows the voices of its first few bots, overlapping like the people in the room.
+    const voices = group.bot_ids.filter(findBot).slice(0, 3);
+    const avatar = node('span', `rail-avatar${voices.length ? ' voices' : ''}`, voices.length ? undefined : group.name.slice(0, 1).toUpperCase());
+    for (const id of voices) avatar.append(node('i', voice(id)));
     const copy = node('span', 'rail-copy');
     const botCount = group.bot_ids.length;
     const messageCount = group.message_count;
-    copy.append(node('strong', null, group.name), node('small', null, `${botCount} bot${botCount === 1 ? '' : 's'} · ${messageCount} message${messageCount === 1 ? '' : 's'}`));
+    copy.append(node('strong', null, group.name), node('small', null, `${botCount} bot${botCount === 1 ? '' : 's'}, ${messageCount} message${messageCount === 1 ? '' : 's'}`));
     button.append(avatar, copy);
     button.addEventListener('click', () => selectGroup(group.id));
-    host.append(button);
+    rows.push(keyed(button, group.id));
   }
+  patchList(host, rows);
 }
 
 function selectGroup(id) {
+  if (id === selectedGroupId && page() === 'chats') return;
   selectedGroupId = id;
   navigate('chats', id);
+  enter($('chat-content'));
 }
+
+function turns(run) { return `${run.completed} turn${run.completed === 1 ? '' : 's'}`; }
 
 function imageCount(run) {
   return run.images ? ` · ${run.images} image${run.images === 1 ? '' : 's'}` : '';
@@ -298,7 +348,11 @@ function renderWorkflowProgress(group, run) {
   const host = $('workflow-progress');
   const signature = JSON.stringify([group.id, flow]);
   if (signature === workflowViewKey) return;
+  const sameGroup = host.dataset.group === group.id;
+  host.dataset.group = group.id;
   workflowViewKey = signature;
+  // Results someone expanded stay expanded when progress updates.
+  const opened = sameGroup ? new Set([...host.querySelectorAll('details')].map((item, index) => item.open && index).filter((index) => index !== false)) : new Set();
   host.replaceChildren(); host.hidden = !flow;
   if (!flow) return;
   const phases = { starting: 'Starting workflow', working: 'Worker preparing result', revising: 'Worker revising result', reviewing: 'Master reviewing quality', confirming: 'Worker confirming completion', handoff: 'Both approved · handing off', complete: 'All tasks approved', blocked: 'Waiting for your input', stopped: 'Workflow stopped' };
@@ -308,8 +362,9 @@ function renderWorkflowProgress(group, run) {
   for (let index = 0; index < flow.task_total; index++) meter.append(node('span', index < results.length ? 'done' : index === results.length && flow.phase !== 'complete' ? 'current' : null));
   host.append(meter);
   host.append(node('p', 'section-note', `${results.length}/${flow.task_total} tasks approved by both bots${flow.phase !== 'complete' && flow.current_worker ? ` · Current worker: ${flow.current_worker}` : ''}${flow.revision ? ` · Revision ${flow.revision}` : ''}`));
-  for (const result of results) {
+  for (const [index, result] of results.entries()) {
     const details = document.createElement('details');
+    details.open = opened.has(index);
     details.append(node('summary', null, `${result.bot_name} · approved result`), node('pre', null, result.result));
     host.append(details);
   }
@@ -318,7 +373,6 @@ function renderWorkflowProgress(group, run) {
 function updateGroupSummary() {
   const group = findGroup(selectedGroupId);
   if (!group) return;
-  $('group-summary').textContent = `${group.bot_ids.length} bot${group.bot_ids.length === 1 ? '' : 's'} in this room · ${group.message_count} message${group.message_count === 1 ? '' : 's'}`;
   $('member-count').textContent = String(group.bot_ids.length);
   const run = latestRun(group.id);
   const status = $('run-status');
@@ -330,10 +384,10 @@ function updateGroupSummary() {
   }
   else if (run && run.status === 'running') {
     if (run.mode === 'workflow') status.textContent = `Workflow · ${run.workflow?.approved_results?.length || 0}/${Math.max(0, run.total - 1)} approved`;
-    else if (run.continuous) status.textContent = `Ongoing · ${run.completed} turns${imageCount(run)}`;
+    else if (run.continuous) status.textContent = `Ongoing · ${turns(run)}${imageCount(run)}`;
     else if (run.duration_seconds) {
       const seconds = Math.max(0, Math.ceil(run.ends_at - Date.now() / 1000));
-      status.textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')} left · ${run.completed} turns`;
+      status.textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')} left · ${turns(run)}`;
     } else status.textContent = `${run.completed}/${run.total} replying`;
     status.classList.add('running');
   }
@@ -341,10 +395,10 @@ function updateGroupSummary() {
   else if (run && run.status === 'blocked') { status.textContent = 'Needs input'; status.classList.add('failed'); }
   else if (run && run.status === 'complete') {
     status.textContent = run.completion_reason === 'approved' ? `Approved by ${run.approved_by || 'a bot'}${imageCount(run)}`
-      : run.completion_reason === 'time_limit' ? `Time finished · ${run.completed} turns` : 'Complete';
+      : run.completion_reason === 'time_limit' ? `Time finished · ${turns(run)}` : 'Complete';
     status.classList.add('ready');
   }
-  else if (run && run.status === 'stopped') status.textContent = `Stopped · ${run.completed} turns`;
+  else if (run && run.status === 'stopped') status.textContent = `Stopped · ${turns(run)}`;
   else if (run && run.status === 'interrupted') { status.textContent = 'Interrupted'; status.classList.add('failed'); }
   else status.textContent = 'Ready';
   const problem = run && ['failed', 'blocked', 'interrupted'].includes(run.status);
@@ -361,16 +415,32 @@ function updateGroupSummary() {
   $('clear-chat').title = isActive(run) ? 'Stop the conversation before clearing the chat.' : '';
   $('stop-conversation').disabled = false;
   for (const id of ['group-mode', 'group-master', 'group-quality', 'save-run-settings']) $(id).disabled = isActive(run);
+  renderLineup(group, run);
   renderWorkflowProgress(group, run);
 }
 
+// The room's speaking order. While a run is going, the bot taking its turn lights up in its voice.
+function renderLineup(group, run) {
+  const bots = group.bot_ids.map(findBot).filter(Boolean);
+  if (!bots.length) { patchList($('group-summary'), [keyed(node('span', 'lineup-empty', 'No bots yet. Switch some on under Bots in this chat.'), 'empty')]); return; }
+  const masterId = group.master_id || group.bot_ids[0];
+  const speaking = run && run.status === 'running' ? run.current_bot : null;
+  patchList($('group-summary'), bots.map((bot) => {
+    const chip = node('span', `speaker ${voice(bot.id)}${bot.name === speaking ? ' speaking' : ''}`);
+    chip.append(node('span', 'speaker-dot', bot.name.slice(0, 1).toUpperCase()), node('span', null, bot.name));
+    if (group.mode === 'workflow' && bot.id === masterId) chip.append(node('small', null, 'reviews'));
+    return keyed(chip, bot.id);
+  }));
+}
+
 function renderGroupMembers() {
-  const host = $('group-members'); host.replaceChildren();
+  const host = $('group-members');
   const group = findGroup(selectedGroupId);
-  if (!group) return;
-  if (!state.bots.length) { host.append(node('div', 'empty-list', 'Create a bot on the Bot setup page.')); return; }
+  if (!group) { host.replaceChildren(); return; }
+  if (!state.bots.length) { patchList(host, [keyed(node('div', 'empty-list', 'Create a bot on the Bot setup page.'), 'empty')]); return; }
   const joined = group.bot_ids.map(findBot).filter(Boolean);
   const others = state.bots.filter((bot) => !group.bot_ids.includes(bot.id));
+  const rows = [];
   for (const bot of [...joined, ...others]) {
     const enabled = group.bot_ids.includes(bot.id);
     const workflow = group.mode === 'workflow';
@@ -397,65 +467,117 @@ function renderGroupMembers() {
       }
       row.insertBefore(controls, row.lastChild);
     }
-    host.append(row);
+    // The order buttons act on this exact sequence, so a new order must swap in new rows.
+    row.dataset.order = `${group.mode}:${masterId}:${sequence.join(',')}`;
+    rows.push(keyed(row, `${group.id}:${bot.id}`));
   }
+  patchList(host, rows);
 }
+
+function messageNode(message) {
+  const isUser = !message.bot_id;
+  const item = node('article', `message${isUser ? ' user' : ` ${voice(message.bot_id)}`}`);
+  item.append(node('div', 'message-avatar', isUser ? 'Y' : message.sender.slice(0, 1).toUpperCase()));
+  const content = node('div', 'message-content');
+  const head = node('div', 'message-head');
+  head.append(node('strong', null, message.sender));
+  if (message.created_at) {
+    const time = new Date(message.created_at);
+    if (!Number.isNaN(time.getTime())) head.append(node('span', null, time.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })));
+  }
+  const bubble = node('div', 'message-bubble', message.text);
+  if (message.image) {
+    const image = node('img', 'message-image');
+    // Fades in once loaded instead of popping in at full size.
+    image.addEventListener('load', () => image.classList.add('loaded'), { once: true });
+    image.addEventListener('error', () => image.classList.add('loaded'), { once: true });
+    image.src = `/media/${encodeURIComponent(message.image)}?${new URLSearchParams({ token })}`;
+    image.alt = message.text.slice(0, 300);
+    image.loading = 'lazy';
+    bubble.prepend(image);
+  }
+  content.append(head, bubble);
+  if (message.files && message.files.length) content.append(node('div', 'attached-files', `Attached: ${message.files.map((path) => path.split('/').pop()).join(', ')}`));
+  item.append(content);
+  return item;
+}
+
+function markApproved(item, approved) {
+  const head = item.querySelector('.message-head');
+  const badge = head.querySelector('.approved-badge');
+  if (approved && !badge) head.querySelector('strong').after(node('span', 'approved-badge', '✅ Approved'));
+  else if (!approved && badge) badge.remove();
+}
+
+const loadingGroups = new Set();
+// The rendered chat is kept between updates, so new messages slide in without redrawing the rest.
+let messageView = null;
 
 function renderMessages() {
   const group = findGroup(selectedGroupId);
   const host = $('messages');
-  const nearBottom = host.scrollHeight - host.scrollTop - host.clientHeight < 90;
-  host.replaceChildren();
-  if (!group) return;
+  if (!group) { host.replaceChildren(); messageView = null; return; }
   const chat = conversations.get(group.id);
   if (!chat) {
-    host.append(node('div', 'conversation-empty', 'Loading messages…'));
-    loadMessages(group.id).then(() => { if (selectedGroupId === group.id) renderMessages(); }, (error) => notice(error.message, true));
+    messageView = null;
+    host.replaceChildren(node('div', 'conversation-empty', 'Loading messages…'));
+    if (!loadingGroups.has(group.id)) {
+      loadingGroups.add(group.id);
+      loadMessages(group.id)
+        .then(() => { if (selectedGroupId === group.id) renderMessages(); }, (error) => notice(error.message, true))
+        .finally(() => loadingGroups.delete(group.id));
+    }
     return;
   }
-  if (chat.hasMore) {
-    const earlier = node('button', 'link-button load-earlier', 'Show earlier messages');
-    earlier.type = 'button';
-    earlier.addEventListener('click', () => loadEarlier(group.id));
-    host.append(earlier);
+  const nearBottom = host.scrollHeight - host.scrollTop - host.clientHeight < 90;
+  let view = messageView;
+  // Opening another chat, loading earlier messages, or a reset redraws; new messages only append.
+  const reuse = view && view.groupId === group.id && view.chat === chat && view.firstId === chat.messages[0]?.id
+    && view.hasMore === chat.hasMore && view.count <= chat.messages.length;
+  if (!reuse) {
+    host.replaceChildren();
+    view = messageView = { groupId: group.id, chat, firstId: chat.messages[0]?.id, hasMore: chat.hasMore, count: 0, items: new Map() };
+    if (chat.hasMore) {
+      const earlier = node('button', 'link-button load-earlier', 'Show earlier messages');
+      earlier.type = 'button';
+      earlier.addEventListener('click', () => loadEarlier(group.id));
+      host.append(earlier);
+    }
+    view.empty = node('div', 'conversation-empty', 'This group is ready. Send a message to begin.');
+    view.status = node('div', 'waiting');
+    host.append(view.empty, view.status);
   }
-  if (!chat.messages.length) host.append(node('div', 'conversation-empty', 'This group is ready. Send a message to begin.'));
+  view.empty.hidden = chat.messages.length > 0;
+  const added = chat.messages.slice(view.count);
+  for (const message of added) {
+    const item = messageNode(message);
+    if (reuse) item.classList.add('enter');
+    view.items.set(message.id, item);
+    host.insertBefore(item, view.status);
+  }
+  view.count = chat.messages.length;
   // A judge's approval is recorded on its run, so recent runs say which messages to mark.
   const approvedIds = new Set(state.runs.map((run) => run.approved_message_id).filter(Boolean));
-  for (const message of chat.messages) {
-    const isUser = !message.bot_id;
-    const item = node('article', `message${isUser ? ' user' : ` ${voice(message.bot_id)}`}`);
-    item.append(node('div', 'message-avatar', isUser ? 'Y' : message.sender.slice(0, 1).toUpperCase()));
-    const content = node('div', 'message-content');
-    const head = node('div', 'message-head');
-    head.append(node('strong', null, message.sender));
-    if (approvedIds.has(message.id)) head.append(node('span', 'approved-badge', '✅ Approved'));
-    if (message.created_at) {
-      const time = new Date(message.created_at);
-      if (!Number.isNaN(time.getTime())) head.append(node('span', null, time.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })));
-    }
-    const bubble = node('div', 'message-bubble', message.text);
-    if (message.image) {
-      const image = node('img', 'message-image');
-      image.src = `/media/${encodeURIComponent(message.image)}?${new URLSearchParams({ token })}`;
-      image.alt = message.text.slice(0, 300);
-      image.loading = 'lazy';
-      bubble.prepend(image);
-    }
-    content.append(head, bubble);
-    if (message.files && message.files.length) content.append(node('div', 'attached-files', `Attached: ${message.files.map((path) => path.split('/').pop()).join(', ')}`));
-    item.append(content); host.append(item);
-  }
+  for (const [id, item] of view.items) markApproved(item, approvedIds.has(id));
+
   const run = latestRun(group.id);
+  let waiting = '', voiceClass = '';
   if (run && run.status === 'queued') {
     const ahead = runsAhead(run);
-    host.append(node('div', 'waiting', `Waiting for a free slot${ahead ? ` · ${ahead} run${ahead === 1 ? '' : 's'} ahead` : ''}…`));
+    waiting = `Waiting for a free slot${ahead ? ` · ${ahead} run${ahead === 1 ? '' : 's'} ahead` : ''}…`;
   }
   else if (run && run.status === 'running') {
     const speaker = state.bots.find((bot) => bot.name === run.current_bot);
-    host.append(node('div', `waiting${speaker ? ` ${voice(speaker.id)}` : ''}`, run.waiting_reason || (run.current_bot ? `${run.current_bot} is replying…` : 'Starting the conversation…')));
+    if (speaker) voiceClass = ` ${voice(speaker.id)}`;
+    waiting = run.waiting_reason || (run.current_bot ? `${run.current_bot} is replying…` : 'Starting the conversation…');
   }
-  if (nearBottom || chat.messages.length < 3) host.scrollTop = host.scrollHeight;
+  const appearing = waiting && view.status.hidden && reuse;
+  view.status.className = `waiting${voiceClass}${appearing ? ' enter' : ''}`;
+  if (view.status.textContent !== waiting) view.status.textContent = waiting;
+  view.status.hidden = !waiting;
+
+  if (!reuse) host.scrollTop = host.scrollHeight;
+  else if (nearBottom) host.scrollTo({ top: host.scrollHeight, behavior: smoothMotion() ? 'smooth' : 'auto' });
 }
 
 function renderChat(full = false) {
@@ -495,7 +617,7 @@ function renderGrants() {
 
 function updateAttachedCount() {
   const count = selectedFiles.size;
-  $('attached-count').textContent = count ? `${count} Desktop file${count === 1 ? '' : 's'} attached to this message` : 'No Desktop files attached';
+  $('attached-count').textContent = count ? `${count} Desktop file${count === 1 ? '' : 's'} attached to this message` : '';
 }
 
 async function loadMessages(groupId) {
@@ -686,7 +808,10 @@ $('new-bot').addEventListener('click', async () => {
     $('bot-name').focus();
   } catch (error) { notice(error.message, true); }
 });
-$('bot-name').addEventListener('input', () => { $('editor-title').textContent = $('bot-name').value || 'New bot'; });
+$('bot-name').addEventListener('input', () => {
+  $('editor-title').textContent = $('bot-name').value || 'New bot';
+  $('editor-avatar').textContent = ($('bot-name').value || '?').slice(0, 1).toUpperCase();
+});
 $('bot-format').addEventListener('change', () => { $('custom-fields').hidden = $('bot-format').value !== 'custom'; });
 $('save-bot').addEventListener('click', async () => {
   if (!selectedBotId) return;
