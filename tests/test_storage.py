@@ -25,12 +25,13 @@ class FakeSupabase:
 
     def __init__(self, password="secret"):
         self.password = password
-        self.tables = {"bots": [], "groups": [], "messages": [], "runs": [], "bot_keys": [], "key_protection": []}
+        self.tables = {"bots": [], "groups": [], "messages": [], "runs": [], "bot_keys": [], "key_protection": [], "documents": []}
         self.missing = set()
         self.reject = set()
         self.down = False
         self.posts = []
         self.objects = {}
+        self.documents = {}  # The documents bucket, by "<user id>/<file>".
         self.calls = []
         self.fail_next = None
         self.sequence = 0
@@ -55,6 +56,19 @@ class FakeSupabase:
         if parts.path.startswith("/rest/v1/"):
             assert headers["apikey"] == CONFIG["key"] and headers["Authorization"].startswith("Bearer ")
             return self.rest(method, parts.path.rsplit("/", 1)[1], query, data)
+        if parts.path.startswith("/storage/v1/object/authenticated/documents/"):
+            name = parts.path.removeprefix("/storage/v1/object/authenticated/documents/")
+            if name not in self.documents:
+                raise storage.SupabaseError(404, "Object not found")
+            return self.documents[name]
+        if parts.path.startswith("/storage/v1/object/documents/"):
+            name = parts.path.removeprefix("/storage/v1/object/documents/")
+            if method == "DELETE":
+                if self.documents.pop(name, None) is None:
+                    raise storage.SupabaseError(404, "Object not found")
+            else:
+                self.documents[name] = data
+            return b"{}"
         if parts.path.startswith("/storage/v1/object/authenticated/images/"):
             name = parts.path.removeprefix("/storage/v1/object/authenticated/images/")
             if name not in self.objects:
@@ -124,6 +138,7 @@ class FakeSupabase:
             for row in removed:
                 if table == "groups":
                     self.tables["messages"] = [item for item in self.tables["messages"] if item["group_id"] != row["id"]]
+                    self.tables["documents"] = [item for item in self.tables["documents"] if item["group_id"] != row["id"]]
                 if table == "bots":
                     self.tables["bot_keys"] = [item for item in self.tables["bot_keys"] if item["bot_id"] != row["id"]]
             return b""

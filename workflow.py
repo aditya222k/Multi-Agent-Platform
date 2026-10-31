@@ -83,6 +83,7 @@ def run_task_workflow(
     on_progress: Callable[[dict], None] = lambda progress: None,
     on_wait: Callable[[str], None] = lambda message: None,
     model_call: Callable = call_bot,
+    documents: list[tuple[str, str]] = (),
 ) -> str:
     if not workers or any(bot["id"] == master["id"] for bot in workers):
         raise UserError("Choose a master and at least one different worker.")
@@ -123,7 +124,7 @@ def run_task_workflow(
             "Inside JSON strings, escape line breaks as \\n and quotation marks as \\\". "
             "Finish the complete JSON object before ending your response. Do not output reasoning or markdown outside it."
         )
-        prompt = make_prompt(group_name, conversation, files, bot=bot)
+        prompt = make_prompt(group_name, conversation, files, bot=bot, documents=documents)
         prompt += "\n\nAuthoritative context for this workflow action:\n" + json.dumps(context, ensure_ascii=False)
         for attempt in range(3):
             raw = _call(bot, prompt, keys.get(bot["id"], ""), instructions, stop, on_wait, model_call)

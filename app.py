@@ -19,9 +19,10 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from core import UserError, blank_bot, read_allowed_files, run_group_conversation, validate_bot, validate_desktop_file, validate_runnable
+from documents import DOCUMENT_FILE, MAX_DOCUMENTS, MAX_UPLOAD_BYTES, clean_document, fit_documents, read_document, summary
 from storage import IMAGE_TYPES, SQLiteStore, SupabaseAuth, SupabaseError, SupabaseStore, load_config
 from vault import DeviceKeys, Vault, VaultLocked
 from workflow import WorkflowBlocked, run_task_workflow
@@ -117,7 +118,7 @@ def group_name(value: object) -> str:
 
 
 def general_group() -> dict:
-    return {"id": uuid.uuid4().hex, "name": "General", "bot_ids": [], "messages": [], "message_count": 0, "mode": "conversation", "master_id": "", "quality_criteria": ""}
+    return {"id": uuid.uuid4().hex, "name": "General", "bot_ids": [], "messages": [], "message_count": 0, "mode": "conversation", "master_id": "", "quality_criteria": "", "documents": []}
 
 
 def message_count(group: dict) -> int:
@@ -157,6 +158,8 @@ class Workspace:
                         if isinstance(message.get("image"), str) and IMAGE_NAME.fullmatch(message["image"]):
                             messages[-1]["image"] = message["image"]
                 group = {"id": item["id"], "name": name, "bot_ids": list(dict.fromkeys(members)), "messages": messages}
+                raw_documents = item.get("documents") if isinstance(item.get("documents"), list) else []
+                group["documents"] = [document for document in map(clean_document, raw_documents) if document is not None]
                 saved_count = item.get("message_count")
                 group["message_count"] = max(saved_count if type(saved_count) is int else 0, len(messages))
                 group["mode"] = item.get("mode") if isinstance(item.get("mode"), str) and item.get("mode") in {"workflow", "conversation"} else "conversation"
@@ -315,7 +318,8 @@ class State(Workspace):
         with self.lock:
             return copy.deepcopy({
                 "bots": self.bots,
-                "groups": [{**{key: value for key, value in group.items() if key != "messages"}, "message_count": message_count(group)} for group in self.groups],
+                "groups": [{**{key: value for key, value in group.items() if key != "messages"}, "message_count": message_count(group),
+                            "documents": [summary(document) for document in group.get("documents", [])]} for group in self.groups],
                 "grants": self.grants,
                 "key_status": {bot["id"]: bool(self.keys.get(bot["id"])) for bot in self.bots},
                 "runs": list(self.runs.values())[-30:][::-1],
@@ -478,8 +482,16 @@ class State(Workspace):
             raise UserError("No local data was found to import.") from None
         try:
             data = source.load(HISTORY_WINDOW)
+            files = {}
             for group in data["groups"]:
                 group["messages"] = source.all_messages(group["id"])
+                for document in group.get("documents", []):
+                    name = document.get("file") if isinstance(document, dict) else None
+                    if isinstance(name, str) and DOCUMENT_FILE.fullmatch(name):
+                        try:
+                            files[name] = source.load_document_file(name)
+                        except OSError:
+                            pass  # The extracted text is still imported without its original file.
         finally:
             source.close()
         local = Workspace()
@@ -508,6 +520,8 @@ class State(Workspace):
                 store.put_bot(bot)
             for group in self.groups:
                 store.put_group(group)
+                for document in group["documents"]:
+                    store.put_document(group["id"], document, files.get(document["file"], b""))
                 for message in group["messages"]:
                     store.add_message(group["id"], message)
                 group["message_count"] = len(group["messages"])
@@ -537,6 +551,12 @@ class State(Workspace):
             if item["id"] == group_id:
                 return item
         raise UserError("Group chat not found.")
+
+    def document(self, group_id: str, document_id: str) -> dict:
+        for item in self.group(group_id).get("documents", []):
+            if item["id"] == document_id:
+                return item
+        raise UserError("Document not found.")
 
 
 # Storage opens in main(), so importing this module (as the tests do) never touches saved data.
@@ -636,6 +656,9 @@ class Handler(BaseHTTPRequestHandler):
             # Image files never change, so the browser can keep them between polls.
             self._send(HTTPStatus.OK, data, IMAGE_TYPES[name.rsplit(".", 1)[1]], "private, max-age=31536000, immutable")
             return
+        if path.path.startswith("/files/"):
+            self._download_document(path)
+            return
         if path.path == "/api/events":
             self._event_stream(parse_qs(path.query).get("token", [""])[0])
             return
@@ -668,6 +691,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.BAD_GATEWAY, {"error": f"Older messages could not be loaded: {error}"})
                 return
             self._json(HTTPStatus.OK, page)
+        elif path.path.startswith("/api/groups/") and path.path.count("/") == 5 and path.path.split("/")[4] == "documents":
+            parts = path.path.split("/")
+            try:
+                with STATE.lock:
+                    document = copy.deepcopy(STATE.document(parts[3], parts[5]))
+            except UserError as error:
+                self._json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+                return
+            self._json(HTTPStatus.OK, {**summary(document), "text": document["text"]})
         elif path.path.startswith("/api/runs/"):
             run_id = path.path.rsplit("/", 1)[-1]
             with STATE.lock:
@@ -675,6 +707,37 @@ class Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK if run else HTTPStatus.NOT_FOUND, run or {"error": "Run not found."})
         else:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+
+    def _download_document(self, path) -> None:
+        # A download link cannot send the token header, so it takes the token as a query like images do.
+        token = parse_qs(path.query).get("token", [""])[0]
+        if not secrets.compare_digest(token, STATE.token):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "Use the URL printed by the server."})
+            return
+        if not self._require_account():
+            return
+        name = path.path.removeprefix("/files/")
+        with STATE.lock:
+            document = next((item for group in STATE.groups for item in group.get("documents", []) if item["file"] == name), None)
+            store = STATE.store
+        try:
+            if document is None or not DOCUMENT_FILE.fullmatch(name) or store is None:
+                raise OSError
+            data = store.load_document_file(name)
+        except OSError:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Document not found."})
+            return
+        content_type = {"pdf": "application/pdf", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}.get(document["kind"], "text/plain; charset=utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        # Always saved, never shown inside the app's page.
+        self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(document['name'])}")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _event_stream(self, token: str) -> None:
         # EventSource cannot send headers, so the stream takes the token as a query like images do.
@@ -712,8 +775,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_api():
             return
         try:
-            body = self._body()
             parts = [part for part in urlsplit(self.path).path.split("/") if part]
+            if len(parts) == 4 and parts[:2] == ["api", "groups"] and parts[3] == "documents":
+                if self._require_account():
+                    self._upload_document(parts[2])
+                return
+            body = self._body()
             if parts == ["api", "login"]:
                 STATE.sign_in(body.get("email"), body.get("password"))
                 self._json(HTTPStatus.OK, STATE.session())
@@ -740,7 +807,7 @@ class Handler(BaseHTTPRequestHandler):
             elif len(parts) >= 3 and parts[:2] == ["api", "bots"]:
                 self._bot_action(parts[2:], body)
             elif parts == ["api", "groups"]:
-                item = {"id": uuid.uuid4().hex, "name": group_name(body.get("name", "New group")), "bot_ids": [], "messages": [], "message_count": 0, "mode": "workflow", "master_id": "", "quality_criteria": ""}
+                item = {"id": uuid.uuid4().hex, "name": group_name(body.get("name", "New group")), "bot_ids": [], "messages": [], "message_count": 0, "mode": "workflow", "master_id": "", "quality_criteria": "", "documents": []}
                 with STATE.lock:
                     STATE.groups.append(item)
                     STATE.require_store().put_group(item)
@@ -833,6 +900,14 @@ class Handler(BaseHTTPRequestHandler):
         if parts == [group_id, "clear"]:
             self._clear_chat(group_id, body)
             return
+        if len(parts) == 4 and parts[1] == "documents" and parts[3] == "remove":
+            with STATE.lock:
+                group = STATE.group(group_id)
+                document = STATE.document(group_id, parts[2])
+                group["documents"].remove(document)
+                STATE.require_store().delete_document(document)
+            self._json(HTTPStatus.OK, STATE.public())
+            return
         if parts == [group_id, "stop"]:
             with STATE.lock:
                 STATE.group(group_id)
@@ -887,8 +962,36 @@ class Handler(BaseHTTPRequestHandler):
             STATE.require_store().put_group(group)
         self._json(HTTPStatus.OK, STATE.public())
 
+    def _upload_document(self, group_id: str) -> None:
+        """Read an uploaded PDF, Word, or text file once and keep it as context for this chat."""
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise UserError("Invalid request size.") from None
+        if size < 1:
+            raise UserError("The file is empty.")
+        if size > MAX_UPLOAD_BYTES:
+            raise UserError("Documents can be up to 25 MB.")
+        with STATE.lock:
+            if len(STATE.group(group_id).get("documents", [])) >= MAX_DOCUMENTS:
+                raise UserError(f"A chat can hold up to {MAX_DOCUMENTS} documents. Remove one first.")
+        data = self.rfile.read(size)
+        if len(data) != size:
+            raise UserError("The upload did not finish. Try again.")
+        # Reading can take seconds, so it happens outside the state lock.
+        document = read_document(data, unquote(self.headers.get("X-File-Name", "")))
+        with STATE.lock:
+            group = STATE.group(group_id)
+            documents = group.setdefault("documents", [])
+            if len(documents) >= MAX_DOCUMENTS:
+                raise UserError(f"A chat can hold up to {MAX_DOCUMENTS} documents. Remove one first.")
+            STATE.require_store().put_document(group_id, document, data)
+            documents.append(document)
+        STATE.events.publish("state", {})
+        self._json(HTTPStatus.CREATED, {**STATE.public(), "document": summary(document)})
+
     def _clear_chat(self, group_id: str, body: dict) -> None:
-        """Delete every message and image in one group. Bots, settings, and run history stay."""
+        """Delete every message, image, and document in one group. Bots, settings, and run history stay."""
         if body.get("confirm") is not True:
             raise UserError("Confirm that every message in this chat should be deleted.")
         STATE.group(group_id)
@@ -903,8 +1006,11 @@ class Handler(BaseHTTPRequestHandler):
             images |= {message["image"] for message in group["messages"] if message.get("image")}
             group["messages"], group["message_count"] = [], 0
             group.pop("last_workflow", None)
+            files = {document["file"] for document in group.get("documents", [])}
+            group["documents"] = []
             store.put_group(group)
             store.clear_messages(group_id, images)
+            store.clear_documents(group_id, files)
             STATE.events.publish("cleared", {"group_id": group_id})
         self._json(HTTPStatus.OK, {**STATE.public(), "cleared": cleared})
 
@@ -944,6 +1050,7 @@ class Handler(BaseHTTPRequestHandler):
             for bot in bots:
                 validate_runnable(bot, keys[bot["id"]])
             files = read_allowed_files(body.get("files", []), STATE.grants)
+            documents = fit_documents(group.get("documents", []))
             store = STATE.require_store()
             user_message = {"id": uuid.uuid4().hex, "sender": "You", "bot_id": "", "text": message.strip(), "created_at": now(), "files": [path for path, _ in files]}
             STATE.add_message(group, user_message)
@@ -962,11 +1069,12 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.runs.pop(finished)
             STATE.publish_run(run_id, persist=True)
             runner = STATE.runner
-        runner.submit(lambda: execute_group_run(run_id, group_id, group_title, bots, history, files, keys))
+        runner.submit(lambda: execute_group_run(run_id, group_id, group_title, bots, history, files, keys, documents))
         self._json(HTTPStatus.ACCEPTED, {"run_id": run_id})
 
 
-def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[dict], history: list[dict], files: list[tuple[str, str]], keys: dict[str, str]) -> None:
+def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[dict], history: list[dict], files: list[tuple[str, str]], keys: dict[str, str],
+                      documents: list[tuple[str, str]] = ()) -> None:
     with STATE.lock:
         run = STATE.runs.get(run_id)
         if run is None or run["status"] != "queued" or run_id not in STATE.stop_events:
@@ -1048,10 +1156,10 @@ def execute_group_run(run_id: str, group_id: str, group_title: str, bots: list[d
             workers = [bot for bot in bots if bot["id"] != master_id]
             reason = run_task_workflow(group_title, master, workers, history, files, keys, on_message,
                                        quality_criteria=quality_criteria, stop_event=stop_event,
-                                       on_progress=on_progress, on_wait=on_wait)
+                                       on_progress=on_progress, on_wait=on_wait, documents=documents)
         else:
             reason = run_group_conversation(group_title, bots, history, files, keys, on_message, duration_seconds=duration, continuous=continuous,
-                                            stop_event=stop_event, on_turn=on_turn, on_wait=on_wait, load_image=load_image)
+                                            stop_event=stop_event, on_turn=on_turn, on_wait=on_wait, load_image=load_image, documents=documents)
         with STATE.lock:
             if run_id in STATE.runs and STATE.runs[run_id]["status"] == "running":
                 STATE.runs[run_id].update(status="stopped" if reason == "stopped" else "complete", completion_reason=reason, current_bot="")

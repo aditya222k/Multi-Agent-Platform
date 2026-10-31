@@ -18,6 +18,7 @@ from typing import Callable
 from urllib.parse import quote, urlencode, urlsplit
 
 from core import UserError, _NoRedirect, _error_message, _tls_context
+from documents import MEDIA_TYPES as DOCUMENT_TYPES
 
 
 PAGE_SIZE = 1000
@@ -27,6 +28,7 @@ RECENT_RUNS = 30
 UPSERT = {"Prefer": "resolution=merge-duplicates,return=minimal"}
 IMAGE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
 MESSAGE_COLUMNS = "id,sender,bot_id,text,image,files,created_at"
+DOCUMENT_COLUMNS = "id,group_id,name,kind,size,pages,text,warnings,file,created_at"
 # The column that identifies a row, for tables where it is not "id".
 ROW_KEYS = {"bot_keys": "bot_id", "key_protection": "owner_id"}
 # Outbox sync: send every SYNC_INTERVAL seconds, or at once when BATCH_SIZE changes are waiting.
@@ -172,11 +174,14 @@ class SQLiteStore:
         create table if not exists runs (id text primary key, created_at real not null default 0, data text not null);
         create table if not exists grants (path text primary key);
         create table if not exists bot_keys (bot_id text primary key, token text not null, hint text not null, saved_at text not null);
+        create table if not exists documents (id text primary key, group_id text not null, data text not null);
+        create index if not exists documents_by_group on documents (group_id);
     """
 
     def __init__(self, path: Path, images_dir: Path):
         self.path = path
         self.images_dir = images_dir
+        self.documents_dir = images_dir.with_name("documents")
         self._lock = threading.Lock()
         self._db = _open_database(path)
         self._db.executescript(self.SCHEMA)
@@ -205,7 +210,7 @@ class SQLiteStore:
 
     @staticmethod
     def _group_row(group: dict) -> tuple:
-        return group["id"], json.dumps({key: value for key, value in group.items() if key not in {"messages", "message_count"}}, ensure_ascii=False)
+        return group["id"], json.dumps({key: value for key, value in group.items() if key not in {"messages", "message_count", "documents"}}, ensure_ascii=False)
 
     @staticmethod
     def _message_row(group_id: str, message: dict) -> tuple:
@@ -245,7 +250,9 @@ class SQLiteStore:
         for group_id, data in self._read("select id, data from groups order by rowid"):
             recent = self._read("select data from messages where group_id = ? order by seq desc limit ?", (group_id, window))
             count = self._read("select count(*) from messages where group_id = ?", (group_id,))[0][0]
-            groups.append({**json.loads(data), "id": group_id, "messages": [json.loads(row[0]) for row in reversed(recent)], "message_count": count})
+            documents = [json.loads(row[0]) for row in self._read("select data from documents where group_id = ? order by rowid", (group_id,))]
+            groups.append({**json.loads(data), "id": group_id, "messages": [json.loads(row[0]) for row in reversed(recent)], "message_count": count,
+                           "documents": documents})
         grants = [row[0] for row in self._read("select path from grants order by rowid")]
         runs = [json.loads(row[0]) for row in reversed(self._read("select data from runs order by created_at desc limit ?", (RECENT_RUNS,)))]
         protection = self.get_meta("key_protection")
@@ -275,7 +282,8 @@ class SQLiteStore:
         self._write([("insert into groups (id, data) values (?, ?) on conflict (id) do update set data = excluded.data", self._group_row(group))])
 
     def delete_group(self, group_id: str) -> None:
-        self._write([("delete from messages where group_id = ?", (group_id,)), ("delete from groups where id = ?", (group_id,))])
+        self._write([("delete from messages where group_id = ?", (group_id,)), ("delete from documents where group_id = ?", (group_id,)),
+                     ("delete from groups where id = ?", (group_id,))])
 
     def group_images(self, group_id: str) -> set[str]:
         return {name for row in self._read("select data from messages where group_id = ?", (group_id,))
@@ -284,12 +292,36 @@ class SQLiteStore:
     def clear_messages(self, group_id: str, images: set[str]) -> None:
         """Delete every message in a group and the image files they showed."""
         self._write([("delete from messages where group_id = ?", (group_id,))])
-        for name in images:
+        self._remove_files(self.images_dir, images)
+
+    def put_document(self, group_id: str, document: dict, data: bytes) -> None:
+        """Save a document's original file under its random name, then its record with the extracted text."""
+        self.documents_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = self.documents_dir / document["file"]
+        path.write_bytes(data)
+        path.chmod(0o600)
+        self._write([("insert into documents (id, group_id, data) values (?, ?, ?) on conflict (id) do update set data = excluded.data",
+                      (document["id"], group_id, json.dumps(document, ensure_ascii=False)))])
+
+    @staticmethod
+    def _remove_files(folder: Path, names: set[str]) -> None:
+        for name in names:
             if Path(name).name == name and not name.startswith("."):  # A bare file name, never a path.
                 try:
-                    (self.images_dir / name).unlink()
+                    (folder / name).unlink()
                 except OSError:
                     pass  # Already gone.
+
+    def delete_document(self, document: dict) -> None:
+        self._write([("delete from documents where id = ?", (document["id"],))])
+        self._remove_files(self.documents_dir, {document["file"]})
+
+    def clear_documents(self, group_id: str, files: set[str]) -> None:
+        self._write([("delete from documents where group_id = ?", (group_id,))])
+        self._remove_files(self.documents_dir, files)
+
+    def load_document_file(self, name: str) -> bytes:
+        return (self.documents_dir / name).read_bytes()
 
     def add_message(self, group_id: str, message: dict) -> None:
         self._write([("insert or ignore into messages (id, group_id, data) values (?, ?, ?)", self._message_row(group_id, message))])
@@ -416,9 +448,10 @@ class Outbox:
             first = self._db.execute("select error from outbox where owner_id = ? and failed = 1 order by seq limit 1", (self.owner_id,)).fetchone()
         return waiting, failed, first[0] if first else ""
 
-    def image(self, target: str) -> bytes | None:
+    def upload(self, target: str) -> bytes | None:
+        """A file still waiting to upload, so it can be shown before it reaches Supabase."""
         with self._lock:
-            row = self._db.execute("select payload from outbox where owner_id = ? and kind = 'image' and target = ? order by seq desc limit 1",
+            row = self._db.execute("select payload from outbox where owner_id = ? and kind in ('image', 'file') and target = ? order by seq desc limit 1",
                                    (self.owner_id, target)).fetchone()
         return bytes(row[0]) if row else None
 
@@ -533,6 +566,9 @@ class SupabaseStore:
                 group["message_count"] = counts.get(group["id"], len(recent))
                 if group.get("last_workflow") is None:
                     group.pop("last_workflow", None)
+            documents = self._documents()
+            for group in groups:
+                group["documents"] = documents.get(group["id"], [])
         except SupabaseError as error:
             if error.status == 404 or "does not exist" in str(error) or "schema cache" in str(error):
                 raise SupabaseError(error.status, "The Supabase tables are missing. Run supabase/schema.sql in the Supabase SQL editor first.") from None
@@ -552,6 +588,19 @@ class SupabaseStore:
         record = protection[0]["data"] if protection and isinstance(protection[0], dict) else None
         return record, {row["bot_id"]: {"token": row["token"], "hint": row["hint"], "saved_at": row["saved_at"]}
                         for row in rows if isinstance(row, dict) and row.get("token")}
+
+    def _documents(self) -> dict[str, list[dict]]:
+        try:
+            rows = self._rows("documents", DOCUMENT_COLUMNS, "created_at.asc,id.asc")
+        except SupabaseError as error:
+            # Accounts created before documents existed can still sign in; attaching documents then fails to sync.
+            self.notice = f"Documents are unavailable: run supabase/schema.sql again in the Supabase SQL editor. ({error})"
+            return {}
+        by_group: dict[str, list[dict]] = {}
+        for row in rows:
+            if isinstance(row, dict):
+                by_group.setdefault(str(row.get("group_id")), []).append(row)
+        return by_group
 
     def _message_counts(self) -> dict[str, int]:
         try:
@@ -653,6 +702,36 @@ class SupabaseStore:
                 self._recent.pop(name, None)
         self._changed()
 
+    def _document_path(self, name: str) -> str:
+        return f"/storage/v1/object/documents/{quote(self.user_id)}/{quote(name)}"
+
+    def put_document(self, group_id: str, document: dict, data: bytes) -> None:
+        """Queue the original file, then the record with its extracted text."""
+        if data:  # Imported documents whose original file went missing keep only their text.
+            self.outbox.add("file", self._document_path(document["file"]), document["file"], data, DOCUMENT_TYPES[document["kind"]])
+        self._upsert("documents", {"owner_id": self.user_id, "group_id": group_id, **document})
+
+    def delete_document(self, document: dict) -> None:
+        self.outbox.add("delete", "documents", document["id"], b"")
+        self.outbox.add("delete_file", self._document_path(document["file"]), document["file"], b"")
+        self._changed()
+
+    def clear_documents(self, group_id: str, files: set[str]) -> None:
+        """Queue deleting a group's documents, after any of its changes still waiting to sync."""
+        self.outbox.add("delete_where", "documents", group_id, json.dumps({"group_id": f"eq.{group_id}"}).encode("utf-8"))
+        for name in sorted(files):
+            self.outbox.add("delete_file", self._document_path(name), name, b"")
+        self._changed()
+
+    def load_document_file(self, name: str) -> bytes:
+        waiting = self.outbox.upload(self._document_path(name))
+        if waiting is not None:
+            return waiting
+        try:
+            return self._request("GET", self._document_path(name).replace("/object/", "/object/authenticated/", 1))
+        except SupabaseError as error:
+            raise OSError(str(error)) from None
+
     def add_message(self, group_id: str, message: dict) -> None:
         # Every row carries the same columns, so a batch can go in one request.
         self._upsert("messages", {"owner_id": self.user_id, "group_id": group_id, "id": message["id"], "sender": message["sender"],
@@ -693,7 +772,7 @@ class SupabaseStore:
             if name in self._recent:
                 return self._recent[name]
         # An image still waiting to upload is shown from the outbox, even while offline.
-        waiting = self.outbox.image(self._image_path(name))
+        waiting = self.outbox.upload(self._image_path(name))
         if waiting is not None:
             return waiting
         try:
@@ -778,12 +857,12 @@ class SupabaseStore:
             self._request("DELETE", f"/rest/v1/{first['target']}", params={ROW_KEYS.get(first["target"], "id"): f"eq.{first['key']}"})
         elif first["kind"] == "delete_where":
             self._request("DELETE", f"/rest/v1/{first['target']}", params=json.loads(first["payload"]))
-        elif first["kind"] == "delete_image":
+        elif first["kind"] in {"delete_image", "delete_file"}:
             try:
                 self._request("DELETE", first["target"])
             except SupabaseError as error:
                 if error.status not in {400, 404}:
-                    raise  # An image that is already gone needs no retry.
+                    raise  # A file that is already gone needs no retry.
         else:
             self._request("POST", first["target"], data=bytes(first["payload"]), headers={"Content-Type": first["content_type"], "x-upsert": "true"})
 

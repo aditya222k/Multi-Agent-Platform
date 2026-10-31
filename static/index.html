@@ -21,6 +21,7 @@
 
     <div id="notice" class="notice" role="status"></div>
     <dialog id="vault-dialog" class="vault-dialog" aria-labelledby="vault-title"><form id="vault-form"></form></dialog>
+    <dialog id="document-dialog" class="vault-dialog document-dialog" aria-labelledby="document-title"><form method="dialog"><div><h2 id="document-title"></h2><p id="document-meta"></p></div><p class="hint">This is the text the bots read. Long documents are shortened in each prompt, between pages where possible.</p><pre id="document-text" class="document-text"></pre><div class="login-actions"><a id="document-download" class="button secondary" download>Download original</a><button class="button primary" value="close">Close</button></div></form></dialog>
 
     <main id="login-page" class="page login-page" hidden>
       <form id="login-form" class="login-card">
@@ -99,7 +100,7 @@
             <label for="chat-input" class="visually-hidden">Message the group</label>
             <div class="composer-box">
               <textarea id="chat-input" rows="3" maxlength="10000" placeholder="Give your bots a task or ask a question…"></textarea>
-              <div class="composer-actions"><span id="attached-count"></span><div class="conversation-actions"><button id="stop-conversation" class="button stop-button" type="button" hidden>Stop conversation</button><button id="send-message" class="button primary" type="button">Start conversation</button></div></div>
+              <div class="composer-actions"><div class="composer-attach"><button id="composer-attach" class="link-button" type="button" title="Attach a PDF, Word, or text document to this chat">Attach document</button><span id="attached-count"></span></div><div class="conversation-actions"><button id="stop-conversation" class="button stop-button" type="button" hidden>Stop conversation</button><button id="send-message" class="button primary" type="button">Start conversation</button></div></div>
             </div>
             <p id="conversation-hint" class="tiny">Bots take turns until you stop. Each turn builds on the conversation so far.</p>
           </div>
@@ -108,6 +109,7 @@
       <aside class="side-panel" aria-label="Group controls">
         <section class="control-card"><h2>Run settings</h2><label class="field">Mode<select id="group-mode"><option value="workflow">Task workflow</option><option value="conversation">Group conversation</option></select></label><div id="workflow-settings"><label class="field">Reviewing master<select id="group-master"></select></label><label class="field">Quality criteria <span class="field-help">What must a result satisfy before the next worker starts?</span><textarea id="group-quality" rows="3" maxlength="4000" placeholder="Complete, accurate, follows the assignment, and usable by the next worker."></textarea></label><p class="hint">The master reviews each worker. Handoff requires both bots to agree. Every worker receives all approved results.</p></div><button id="save-run-settings" class="button secondary small" type="button">Save run settings</button></section>
         <section class="control-card"><div class="control-heading"><h2>Bots in this chat</h2><span id="member-count" class="count">0</span></div><p class="hint">They speak in the order shown.</p><div id="group-members" class="toggle-list"></div></section>
+        <section class="control-card"><div class="control-heading"><h2>Documents</h2><span id="document-count" class="count">0</span></div><p class="hint">PDF, Word (.docx), or text files, up to 25 MB each. Every bot in this chat reads their text on each turn until you remove them. Their text is sent to the bots' API endpoints.</p><div id="documents" class="grant-list"></div><button id="attach-document" class="button secondary small" type="button">Attach document</button><input id="document-input" type="file" accept=".pdf,.docx,.txt,.md,.csv,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain" multiple hidden><p class="tiny">Scanned PDFs (pictures of pages) and old .doc files can't be read yet.</p></section>
         <section class="control-card"><h2>Desktop files</h2><p class="hint">Allow individual Desktop files, then choose which ones this message may read. Their text is sent to the bots' API endpoints.</p><div class="file-add"><input id="file-path" spellcheck="false" placeholder="/Users/you/Desktop/notes.txt" aria-label="Desktop file path"><button id="allow-file" class="button secondary small" type="button">Allow</button></div><button id="pick-file" class="link-button" type="button">Choose with file dialog</button><div id="grants" class="grant-list"></div><p class="tiny">Text files only, read-only, up to 128 KB each.</p></section>
       </aside>
     </main>

@@ -590,6 +590,7 @@ function renderChat(full = false) {
   updateGroupSummary();
   renderMessages();
   renderGroupMembers();
+  renderDocuments();
   renderGrants();
 }
 
@@ -618,6 +619,89 @@ function renderGrants() {
 function updateAttachedCount() {
   const count = selectedFiles.size;
   $('attached-count').textContent = count ? `${count} Desktop file${count === 1 ? '' : 's'} attached to this message` : '';
+}
+
+const DOCUMENT_KINDS = { pdf: 'PDF', docx: 'Word', txt: 'Text' };
+const DOCUMENT_BADGES = { pdf: 'PDF', docx: 'DOCX', txt: 'TXT' };
+const MAX_DOCUMENT_BYTES = 25 * 1024 * 1024;
+let uploading = 0;
+
+function fileSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function documentMeta(doc) {
+  const parts = [DOCUMENT_KINDS[doc.kind] || doc.kind];
+  if (doc.pages) parts.push(`${doc.pages} page${doc.pages === 1 ? '' : 's'}`);
+  parts.push(fileSize(doc.size));
+  return parts.join(' · ');
+}
+
+function renderDocuments() {
+  const group = findGroup(selectedGroupId);
+  const documents = group?.documents || [];
+  $('document-count').textContent = documents.length;
+  for (const id of ['attach-document', 'composer-attach']) $(id).disabled = !group || uploading > 0;
+  $('attach-document').textContent = uploading ? 'Reading…' : 'Attach document';
+  const host = $('documents'); host.replaceChildren();
+  if (!documents.length) host.append(node('div', 'empty-list', 'No documents in this chat.'));
+  for (const doc of documents) {
+    const row = node('div', 'grant-row document-row');
+    const badge = node('span', `document-badge ${doc.kind}`, DOCUMENT_BADGES[doc.kind] || doc.kind);
+    badge.setAttribute('aria-hidden', 'true');
+    const info = node('div', 'grant-name');
+    const open = node('button', 'document-open', doc.name); open.type = 'button'; open.title = 'Preview the text the bots read';
+    open.addEventListener('click', () => previewDocument(group.id, doc));
+    info.append(open, node('small', null, documentMeta(doc)));
+    for (const warning of doc.warnings) info.append(node('small', 'document-warning', warning));
+    const remove = node('button', 'remove-button', '×'); remove.type = 'button'; remove.title = 'Remove document';
+    remove.setAttribute('aria-label', `Remove ${doc.name} from this chat`);
+    remove.addEventListener('click', async () => {
+      if (!confirm(`Remove "${doc.name}" from this chat? The bots stop reading it.`)) return;
+      try { state = await api(`/api/groups/${group.id}/documents/${doc.id}/remove`, {}); renderDocuments(); notice('Document removed.'); }
+      catch (error) { notice(error.message, true); }
+    });
+    row.append(badge, info, remove); host.append(row);
+  }
+}
+
+// Files go up as raw bytes, so this skips api(), which sends JSON.
+async function uploadDocuments(files) {
+  const group = findGroup(selectedGroupId);
+  if (!group || !files.length) return;
+  uploading += 1; renderDocuments();
+  try {
+    for (const file of files) {
+      if (file.size > MAX_DOCUMENT_BYTES) { notice(`${file.name} is larger than 25 MB.`, true); continue; }
+      notice(`Reading ${file.name}…`);
+      try {
+        const response = await fetch(`/api/groups/${group.id}/documents`, {
+          method: 'POST',
+          headers: { 'X-Local-Token': token, 'Content-Type': 'application/octet-stream', 'X-File-Name': encodeURIComponent(file.name) },
+          body: file,
+        });
+        const data = await response.json();
+        if (response.status === 401 && data.login_required) { showLogin(); return; }
+        if (!response.ok) throw new Error(data.error || `Upload failed (${response.status})`);
+        state = data;
+        const warning = data.document.warnings[0];
+        notice(warning ? `${file.name} attached. ${warning}` : `${file.name} attached. The bots in this chat will read it.`, !!warning);
+      } catch (error) { notice(error.message, true); }
+    }
+  } finally { uploading -= 1; renderDocuments(); }
+}
+
+async function previewDocument(groupId, doc) {
+  try {
+    const full = await api(`/api/groups/${groupId}/documents/${doc.id}`);
+    $('document-title').textContent = full.name;
+    $('document-meta').textContent = `${documentMeta(full)} · ${full.chars.toLocaleString()} characters of text`;
+    $('document-text').textContent = full.text;
+    $('document-download').href = `/files/${full.file}?${new URLSearchParams({ token })}`;
+    $('document-dialog').showModal();
+  } catch (error) { notice(error.message, true); }
 }
 
 async function loadMessages(groupId) {
@@ -1092,7 +1176,9 @@ $('clear-chat').addEventListener('click', async () => {
   const group = findGroup(selectedGroupId);
   if (!group) return;
   const count = group.message_count;
-  if (!confirm(`Delete all ${count} message${count === 1 ? '' : 's'} in "${group.name}", including their images? Bots and settings stay. This cannot be undone.`)) return;
+  const documents = group.documents?.length || 0;
+  const alsoDocuments = documents ? ` and ${documents} attached document${documents === 1 ? '' : 's'}` : '';
+  if (!confirm(`Delete all ${count} message${count === 1 ? '' : 's'} in "${group.name}", including their images${alsoDocuments}? Bots and settings stay. This cannot be undone.`)) return;
   try {
     const result = await api(`/api/groups/${group.id}/clear`, { confirm: true });
     state = result;
@@ -1126,6 +1212,27 @@ $('pick-file').addEventListener('click', async () => {
     renderGrants(); notice('Desktop file allowed. Select it to attach to a message.');
   } catch (error) { notice(error.message, true); }
   finally { button.disabled = false; }
+});
+
+for (const id of ['attach-document', 'composer-attach']) $(id).addEventListener('click', () => $('document-input').click());
+$('document-input').addEventListener('change', () => {
+  const files = [...$('document-input').files];
+  $('document-input').value = '';
+  uploadDocuments(files);
+});
+// Dropping files anywhere on the open chat attaches them to it.
+const dropZone = document.querySelector('.chat-panel');
+dropZone.addEventListener('dragover', (event) => {
+  if (!event.dataTransfer.types.includes('Files') || !findGroup(selectedGroupId)) return;
+  event.preventDefault();
+  dropZone.classList.add('dropping');
+});
+dropZone.addEventListener('dragleave', (event) => { if (!dropZone.contains(event.relatedTarget)) dropZone.classList.remove('dropping'); });
+dropZone.addEventListener('drop', (event) => {
+  dropZone.classList.remove('dropping');
+  if (!event.dataTransfer.files.length) return;
+  event.preventDefault();
+  uploadDocuments([...event.dataTransfer.files]);
 });
 
 initialize();

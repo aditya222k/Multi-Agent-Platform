@@ -13,6 +13,7 @@
 - **Bring any model.** Each bot has its own endpoint, model, and API key. Supports Chat Completions, Responses, Messages, and custom JSON APIs, including local models.
 - **Group conversations.** Bots take turns in an order you choose, each one seeing the conversation so far, until you press Stop.
 - **Approval-gated task workflows.** Workers complete tasks in sequence. A reviewing master must approve each result, and the worker must confirm it, before the work is handed off.
+- **Documents.** Attach PDF, Word (.docx), or text files to a chat. Every bot reads their text until you remove them.
 - **Desktop file context.** Share read-only snapshots of specific Desktop files with a message.
 - **Private by design.** Listens only on `127.0.0.1`, needs a launch token, and keeps API keys in memory only.
 - **Zero dependencies.** Pure Python standard library plus a vanilla JS frontend.
@@ -100,6 +101,18 @@ Worker 1 submits ──► Master reviews ──► Worker confirms ──► bo
 
 Both approvals must point to the **same submitted result** before the next worker starts. Each decision gets three attempts in total. If none returns a valid decision, the workflow stops without a handoff. Progress and approved outputs are saved. Starting a new workflow begins a fresh task sequence.
 
+## Documents
+
+Attach a PDF, Word document (.docx), or text file to a chat with **Attach document**, or drop it onto the chat. It stays attached until you remove it or clear the chat, and every bot in the chat reads it on each turn.
+
+- **Read once.** Each file's text is read when you attach it and saved, so it is not read again on every turn. Click a document's name to see exactly what the bots receive, or download the original.
+- **PDFs** need the `pypdf` package (`python3 -m pip install pypdf`). Text is kept with `[page N]` markers so bots can cite pages. PDFs with no selectable text (scanned pages) are refused with an explanation; pages without text in an otherwise readable PDF are reported as a warning. Password-protected PDFs are refused.
+- **Word documents** need nothing extra. Headings, lists, and tables are kept. Old `.doc` files are refused; save them as `.docx` first.
+- **Fitting into prompts.** All of a chat's documents share about 80,000 characters of each prompt. Short documents go in whole; long ones are cut at a page boundary (or a line, for Word and text), with a note such as "pages 1–40 of 100 included".
+- **Limits:** 25 MB per file and 10 documents per chat. Each file is read in a separate process that is stopped after 60 seconds. Word files that would unpack to more than 200 MB, or that contain a DOCTYPE, are refused.
+- The file type is checked from the file's contents, not its name. Originals are saved under random names in `.local/documents/`, or in the private `documents` bucket with Supabase.
+- Document text is framed as data, not instructions, but a document can still try to steer a model. Only attach documents you would paste into the chat yourself.
+
 ## Desktop files
 
 - Only individual files inside your Desktop can be allowed. Paths outside Desktop, folders, and symlinks that lead outside are rejected.
@@ -125,7 +138,7 @@ This needs the `cryptography` package (`python3 -m pip install cryptography`). W
 By default everything is saved on your computer and no setup is needed. To keep bots and chats in a Supabase account instead, so each person signs in and sees only their own data:
 
 1. Create a project at [supabase.com](https://supabase.com).
-2. Open **SQL Editor**, paste [`supabase/schema.sql`](supabase/schema.sql), and run it. It creates the tables, row-level security rules, and a private `images` bucket.
+2. Open **SQL Editor**, paste [`supabase/schema.sql`](supabase/schema.sql), and run it. It creates the tables, row-level security rules, and private `images` and `documents` buckets. If you set Supabase up before documents existed, run it again; it is safe to re-run.
 3. Under **Authentication → Sign In / Providers**, turn off public sign-ups, then invite each person from **Authentication → Users**.
 4. Copy `.env.example` to `.env` and fill in the **Project URL** and **publishable (anon) key** from **Project Settings → API**. Never use the secret / `service_role` key.
 5. Run `python3 app.py` and sign in.
@@ -140,9 +153,9 @@ If the account is empty and this computer has local data, the app offers to impo
 - **API keys are readable only in server memory.** Saved keys are stored encrypted and unlock with your passphrase; unsaved keys are gone after a restart.
 - Without Supabase, bot settings, chat history, run history, and allowed file paths are stored in a SQLite database, `.local/app.db`, with owner-only permissions. Git ignores `.local/` and `.env`. An older `.local/settings.json` is imported once on first start and left in place as a backup.
 - The server keeps only the latest 200 messages per group in memory. Older messages stay in storage and load a page at a time.
-- With Supabase, bots, chats, and generated images are sent to your Supabase project, protected by row-level security. Allowed file paths stay in `.local/grants.json`.
+- With Supabase, bots, chats, generated images, and attached documents are sent to your Supabase project, protected by row-level security. Allowed file paths stay in `.local/grants.json`.
 - HTTPS certificates are verified. On macOS without default certificates, `/etc/ssl/cert.pem` is used. `SSL_CERT_FILE` and `SSL_CERT_DIR` take precedence.
-- File content you share is sent to the API endpoints of the bots in that group.
+- File and document content you share is sent to the API endpoints of the bots in that group.
 
 ## How it works
 
@@ -150,7 +163,8 @@ If the account is empty and this computer has local data, the app offers to impo
 static/        Frontend (index.html, app.js, style.css)
 app.py         HTTP server, saved state, sign-in, and background conversation runs
 core.py        Bot validation, prompt building, model API calls, file access
-storage.py     Local SQLite storage or a Supabase account (auth, tables, images)
+documents.py   Reading PDF, Word, and text documents, and fitting them into prompts
+storage.py     Local SQLite storage or a Supabase account (auth, tables, images, documents)
 workflow.py    Approval-gated task workflow engine
 supabase/      Schema to run once in the Supabase SQL editor
 tests/         Unit tests using local fakes
